@@ -6,7 +6,7 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 
-type ClientSender = mpsc::UnboundedSender<String>;
+type ClientSender = mpsc::Sender<String>;
 
 type Rooms = Arc<Mutex<HashMap<String, HashMap<String, ClientSender>>>>;
 
@@ -41,7 +41,7 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> std::io::Result<()> {
 
     let mut reader = BufReader::new(reader);
 
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let (tx, rx) = mpsc::channel::<String>(32);
 
     tokio::spawn(write_messages(writer, rx));
 
@@ -97,12 +97,12 @@ async fn join_room(rooms: &Rooms, room_code: &str, client_id: &str, sender: Clie
     let room = rooms.entry(room_code.to_string()).or_default();
 
     for peer_sender in room.values() {
-        let _ = peer_sender.send(format!("PEER_JOINED {client_id}\n"));
+        let _ = peer_sender.send(format!("PEER_JOINED {client_id}\n")).await;
     }
 
     room.insert(client_id.to_string(), sender.clone());
 
-    let _ = sender.send(format!("JOINED {room_code}\n"));
+    let _ = sender.send(format!("JOINED {room_code}\n")).await;
 
     println!("{client_id} joined {room_code}");
 }
@@ -119,7 +119,9 @@ async fn broadcast(rooms: &Rooms, room_code: &str, sender_id: &str, message: &st
             continue;
         }
 
-        let _ = sender.send(format!("MESSAGE {sender_id} {message}\n"));
+        let _ = sender
+            .send(format!("MESSAGE {sender_id} {message}\n"))
+            .await;
     }
 }
 
@@ -130,7 +132,7 @@ async fn leave_room(rooms: &Rooms, room_code: &str, client_id: &str) {
         room.remove(client_id);
 
         for sender in room.values() {
-            let _ = sender.send(format!("PEER_LEFT {client_id}\n"));
+            let _ = sender.send(format!("PEER_LEFT {client_id}\n")).await;
         }
 
         room.is_empty()
@@ -145,7 +147,7 @@ async fn leave_room(rooms: &Rooms, room_code: &str, client_id: &str) {
     println!("{client_id} left {room_code}");
 }
 
-async fn write_messages(mut writer: OwnedWriteHalf, mut receiver: mpsc::UnboundedReceiver<String>) {
+async fn write_messages(mut writer: OwnedWriteHalf, mut receiver: mpsc::Receiver<String>) {
     while let Some(message) = receiver.recv().await {
         if writer.write_all(message.as_bytes()).await.is_err() {
             break;
