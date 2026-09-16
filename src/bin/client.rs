@@ -1,10 +1,18 @@
-use std::{io, net::TcpStream};
+use std::{
+    io::{self, Write},
+    net::TcpStream,
+};
 
 fn main() -> io::Result<()> {
-    let stream = TcpStream::connect("127.0.0.1:9000")?;
+    let mut stream = TcpStream::connect("127.0.0.1:9000")?;
 
     println!("Connected to signaling server");
-    println!("Server: {}", stream.peer_addr()?);
+
+    let room_code = "ABC123";
+
+    writeln!(stream, "JOIN {room_code}")?;
+
+    println!("Joined room: {room_code}");
 
     Ok(())
 }
