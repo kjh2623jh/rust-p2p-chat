@@ -1,12 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    net::{TcpListener, TcpStream},
-    sync::Mutex,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
+    sync::{Mutex, mpsc},
 };
 
-type Rooms = Arc<Mutex<HashMap<String, Vec<String>>>>;
+type ClientSender = mpsc::UnboundedSender<String>;
+
+type Rooms = Arc<Mutex<HashMap<String, HashMap<String, ClientSender>>>>;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -33,34 +35,120 @@ async fn main() -> std::io::Result<()> {
 
 async fn handle_client(stream: TcpStream, rooms: Rooms) -> std::io::Result<()> {
     let addr = stream.peer_addr()?;
+    let client_id = addr.to_string();
 
-    let mut reader = BufReader::new(stream);
+    let (reader, writer) = stream.into_split();
 
-    let mut message = String::new();
+    let mut reader = BufReader::new(reader);
 
-    reader.read_line(&mut message).await?;
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
 
-    let message = message.trim();
+    tokio::spawn(write_messages(writer, rx));
 
-    let mut parts = message.split_whitespace();
+    let mut current_room: Option<String> = None;
 
-    match (parts.next(), parts.next()) {
-        (Some("JOIN"), Some(room_code)) => {
-            let mut rooms = rooms.lock().await;
+    loop {
+        let mut message = String::new();
 
-            let room = rooms.entry(room_code.to_string()).or_default();
+        let bytes_read = reader.read_line(&mut message).await?;
 
-            room.push(addr.to_string());
-
-            println!("{addr} joined room {room_code}");
-
-            println!("Rooms: {rooms:#?}");
+        if bytes_read == 0 {
+            println!("Client disconnected: {client_id}");
+            break;
         }
 
-        _ => {
-            println!("Unknown message: {message}");
+        let message = message.trim();
+
+        let mut parts = message.split_whitespace();
+
+        match parts.next() {
+            Some("JOIN") => {
+                if let Some(room_code) = parts.next() {
+                    join_room(&rooms, room_code, &client_id, tx.clone()).await;
+
+                    current_room = Some(room_code.to_string());
+                }
+            }
+
+            Some("MSG") => {
+                let text = parts.collect::<Vec<_>>().join(" ");
+
+                if let Some(room_code) = &current_room {
+                    broadcast(&rooms, room_code, &client_id, &text).await;
+                }
+            }
+
+            _ => {
+                let _ = tx.send("ERROR unknown command\n".to_string());
+            }
         }
     }
 
+    if let Some(room_code) = current_room {
+        leave_room(&rooms, &room_code, &client_id).await;
+    }
+
     Ok(())
+}
+
+async fn join_room(rooms: &Rooms, room_code: &str, client_id: &str, sender: ClientSender) {
+    let mut rooms = rooms.lock().await;
+
+    let room = rooms.entry(room_code.to_string()).or_default();
+
+    for peer_sender in room.values() {
+        let _ = peer_sender.send(format!("PEER_JOINED {client_id}\n"));
+    }
+
+    room.insert(client_id.to_string(), sender.clone());
+
+    let _ = sender.send(format!("JOINED {room_code}\n"));
+
+    println!("{client_id} joined {room_code}");
+}
+
+async fn broadcast(rooms: &Rooms, room_code: &str, sender_id: &str, message: &str) {
+    let rooms = rooms.lock().await;
+
+    let Some(room) = rooms.get(room_code) else {
+        return;
+    };
+
+    for (client_id, sender) in room {
+        if client_id == sender_id {
+            continue;
+        }
+
+        let _ = sender.send(format!("MESSAGE {sender_id} {message}\n"));
+    }
+}
+
+async fn leave_room(rooms: &Rooms, room_code: &str, client_id: &str) {
+    let mut rooms = rooms.lock().await;
+
+    let should_remove_room = if let Some(room) = rooms.get_mut(room_code) {
+        room.remove(client_id);
+
+        for sender in room.values() {
+            let _ = sender.send(format!("PEER_LEFT {client_id}\n"));
+        }
+
+        room.is_empty()
+    } else {
+        false
+    };
+
+    if should_remove_room {
+        rooms.remove(room_code);
+    }
+
+    println!("{client_id} left {room_code}");
+}
+
+async fn write_messages(mut writer: OwnedWriteHalf, mut receiver: mpsc::UnboundedReceiver<String>) {
+    while let Some(message) = receiver.recv().await {
+        if writer.write_all(message.as_bytes()).await.is_err() {
+            break;
+        }
+    }
 }
