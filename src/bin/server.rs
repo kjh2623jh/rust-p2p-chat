@@ -1,44 +1,44 @@
-use std::{
-    collections::HashMap,
-    io::{self, BufRead, BufReader},
-    net::{SocketAddr, TcpListener, TcpStream},
+use std::{collections::HashMap, sync::Arc};
+
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
 };
 
-fn main() -> io::Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:9000")?;
+type Rooms = Arc<Mutex<HashMap<String, Vec<String>>>>;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:9000").await?;
+
+    let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
     println!("Signaling server listening on 0.0.0.0:9000");
 
-    let mut rooms: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+    loop {
+        let (stream, addr) = listener.accept().await?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                handle_client(stream, &mut rooms)?;
-            }
+        println!("Client connected: {addr}");
 
-            Err(error) => {
-                eprintln!("Connection error: {error}");
+        let rooms = Arc::clone(&rooms);
+
+        tokio::spawn(async move {
+            if let Err(error) = handle_client(stream, rooms).await {
+                eprintln!("Client error ({addr}): {error}");
             }
-        }
+        });
     }
-
-    Ok(())
 }
 
-fn handle_client(
-    stream: TcpStream,
-    rooms: &mut HashMap<String, Vec<SocketAddr>>,
-) -> io::Result<()> {
-    let client_addr = stream.peer_addr()?;
-
-    println!("Client connected: {client_addr}");
+async fn handle_client(stream: TcpStream, rooms: Rooms) -> std::io::Result<()> {
+    let addr = stream.peer_addr()?;
 
     let mut reader = BufReader::new(stream);
 
     let mut message = String::new();
 
-    reader.read_line(&mut message)?;
+    reader.read_line(&mut message).await?;
 
     let message = message.trim();
 
@@ -46,18 +46,19 @@ fn handle_client(
 
     match (parts.next(), parts.next()) {
         (Some("JOIN"), Some(room_code)) => {
+            let mut rooms = rooms.lock().await;
+
             let room = rooms.entry(room_code.to_string()).or_default();
 
-            room.push(client_addr);
+            room.push(addr.to_string());
 
-            println!("{client_addr} joined room {room_code}");
+            println!("{addr} joined room {room_code}");
 
-            println!("Current rooms:");
-            println!("{rooms:#?}");
+            println!("Rooms: {rooms:#?}");
         }
 
         _ => {
-            println!("Unknown message from {client_addr}: {message}");
+            println!("Unknown message: {message}");
         }
     }
 
