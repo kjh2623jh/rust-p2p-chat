@@ -61,9 +61,26 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> std::io::Result<()> {
 
         match parts.next() {
             Some("JOIN") => {
+                // if current_room.is_some() {
+                //     let _ = tx.send("ALREADY_IN_ROOM\n".to_string()).await;
+                //     continue;
+                // }
+
                 if let Some(room_code) = parts.next() {
-                    join_room(&rooms, room_code, &client_id, tx.clone()).await;
-                    current_room = Some(room_code.to_string());
+                    match join_room(&rooms, room_code, &client_id, tx.clone()).await {
+                        Ok(()) => {
+                            current_room = Some(room_code.to_string());
+                        }
+                        Err("ROOM_FULL") => {
+                            let _ = tx.send("ROOM_FULL\n".to_string()).await;
+                        }
+                        Err("ALREADY_JOINED") => {
+                            let _ = tx.send("ALREADY_JOINED\n".to_string()).await;
+                        }
+                        Err(_) => {
+                            let _ = tx.send("JOIN_FAILED\n".to_string()).await;
+                        }
+                    }
                 }
             }
             Some("MSG") => {
@@ -100,9 +117,21 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn join_room(rooms: &Rooms, room_code: &str, client_id: &str, sender: ClientSender) {
+async fn join_room(
+    rooms: &Rooms,
+    room_code: &str,
+    client_id: &str,
+    sender: ClientSender,
+) -> Result<(), &'static str> {
     let mut rooms = rooms.lock().await;
     let room = rooms.entry(room_code.to_string()).or_default();
+
+    if room.contains_key(client_id) {
+        return Err("ALREADY_JOINED");
+    }
+    if room.len() >= 2 {
+        return Err("ROOM_FULL");
+    }
 
     room.insert(
         client_id.to_string(),
@@ -114,6 +143,8 @@ async fn join_room(rooms: &Rooms, room_code: &str, client_id: &str, sender: Clie
 
     let _ = sender.send(format!("JOINED {room_code}\n")).await;
     println!("{client_id} joined {room_code}");
+
+    Ok(())
 }
 
 async fn broadcast(rooms: &Rooms, room_code: &str, sender_id: &str, message: &str) {
