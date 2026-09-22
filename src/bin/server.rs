@@ -1,8 +1,7 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
+    net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedWriteHalf},
     sync::{Mutex, mpsc},
 };
 
@@ -14,17 +13,34 @@ struct Peer {
     udp_addr: Option<SocketAddr>,
 }
 
-type Rooms = Arc<Mutex<HashMap<String, HashMap<String, Peer>>>>;
+type Room = HashMap<String, Peer>;
+type Rooms = Arc<Mutex<HashMap<String, Room>>>;
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:9000").await?;
+async fn main() -> io::Result<()> {
+    let tcp_listener = TcpListener::bind("0.0.0.0:9000").await?;
+    let udp_socket = UdpSocket::bind("0.0.0.0:9001").await?;
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
-    println!("Signaling server listening on 0.0.0.0:9000");
 
+    println!("TCP signaling : 0.0.0.0:9000");
+    println!("UDP discovery : 0.0.0.0:9001");
+
+    // UDP endpoint 등록 처리
+    {
+        let rooms = Arc::clone(&rooms);
+
+        tokio::spawn(async move {
+            if let Err(error) = handle_udp_registration(udp_socket, rooms).await {
+                eprintln!("UDP registration error: {error}");
+            }
+        });
+    }
+
+    // TCP signaling
     loop {
-        let (stream, addr) = listener.accept().await?;
-        println!("Client connected: {addr}");
+        let (stream, addr) = tcp_listener.accept().await?;
+
+        println!("TCP connected: {addr}");
 
         let rooms = Arc::clone(&rooms);
 
@@ -36,14 +52,20 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-async fn handle_client(stream: TcpStream, rooms: Rooms) -> std::io::Result<()> {
-    let addr = stream.peer_addr()?;
-    let client_id = addr.to_string();
+async fn handle_client(stream: TcpStream, rooms: Rooms) -> io::Result<()> {
+    let tcp_addr = stream.peer_addr()?;
+    // 지금은 TCP endpoint 자체를 임시 client_id로 사용
+    let client_id = tcp_addr.to_string();
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let (tx, rx) = mpsc::channel::<String>(32);
 
     tokio::spawn(write_messages(writer, rx));
+
+    // client에게 자신의 ID 전달
+    if tx.send(format!("CLIENT_ID {client_id}\n")).await.is_err() {
+        return Ok(());
+    }
 
     let mut current_room: Option<String> = None;
 
@@ -52,7 +74,7 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> std::io::Result<()> {
         let bytes_read = reader.read_line(&mut message).await?;
 
         if bytes_read == 0 {
-            println!("Client disconnected: {client_id}");
+            println!("TCP disconnected: {client_id}");
             break;
         }
 
@@ -61,55 +83,34 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> std::io::Result<()> {
 
         match parts.next() {
             Some("JOIN") => {
+                // 이미 다른 방에 들어가 있다면 거절
                 // if current_room.is_some() {
                 //     let _ = tx.send("ALREADY_IN_ROOM\n".to_string()).await;
                 //     continue;
                 // }
 
-                if let Some(room_code) = parts.next() {
-                    match join_room(&rooms, room_code, &client_id, tx.clone()).await {
-                        Ok(()) => {
-                            current_room = Some(room_code.to_string());
-                        }
-                        Err("ROOM_FULL") => {
-                            let _ = tx.send("ROOM_FULL\n".to_string()).await;
-                        }
-                        Err("ALREADY_JOINED") => {
-                            let _ = tx.send("ALREADY_JOINED\n".to_string()).await;
-                        }
-                        Err(_) => {
-                            let _ = tx.send("JOIN_FAILED\n".to_string()).await;
-                        }
+                let Some(room_code) = parts.next() else {
+                    let _ = tx.send("ERROR INVALID_JOIN\n".to_string()).await;
+                    continue;
+                };
+
+                // 방에 참가
+                match join_room(&rooms, room_code, &client_id, tx.clone()).await {
+                    Ok(()) => {
+                        current_room = Some(room_code.to_string());
+                    }
+                    Err(error) => {
+                        let _ = tx.send(format!("{error}\n")).await;
                     }
                 }
             }
-            Some("MSG") => {
-                let text = parts.collect::<Vec<_>>().join(" ");
-
-                if let Some(room_code) = &current_room {
-                    broadcast(&rooms, room_code, &client_id, &text).await;
-                }
-            }
-            Some("REGISTER_UDP") => {
-                let Some(port) = parts.next() else {
-                    continue;
-                };
-                let Ok(port) = port.parse::<u16>() else {
-                    continue;
-                };
-                let Some(room_code) = &current_room else {
-                    continue;
-                };
-                let udp_addr = SocketAddr::new(addr.ip(), port);
-
-                register_udp(&rooms, room_code, &client_id, udp_addr).await;
-            }
             _ => {
-                let _ = tx.send("ERROR unknown command\n".to_string());
+                let _ = tx.send("ERROR UNKNOWN_COMMAND\n".to_string()).await;
             }
         }
     }
 
+    // 연결이 끊겼다면 room에서 제거
     if let Some(room_code) = current_room {
         leave_room(&rooms, &room_code, &client_id).await;
     }
@@ -126,9 +127,12 @@ async fn join_room(
     let mut rooms = rooms.lock().await;
     let room = rooms.entry(room_code.to_string()).or_default();
 
+    // 같은 client_id 중복 방어
     if room.contains_key(client_id) {
         return Err("ALREADY_JOINED");
     }
+
+    // 1:1 P2P이므로 최대 2명
     if room.len() >= 2 {
         return Err("ROOM_FULL");
     }
@@ -141,49 +145,41 @@ async fn join_room(
         },
     );
 
+    println!("{client_id} joined room {room_code}");
+
+    drop(rooms);
+
     let _ = sender.send(format!("JOINED {room_code}\n")).await;
-    println!("{client_id} joined {room_code}");
 
     Ok(())
 }
 
-async fn broadcast(rooms: &Rooms, room_code: &str, sender_id: &str, message: &str) {
-    let rooms = rooms.lock().await;
-    let Some(room) = rooms.get(room_code) else {
-        return;
-    };
-
-    for (client_id, peer) in room {
-        if client_id == sender_id {
-            continue;
-        }
-
-        let _ = peer
-            .sender
-            .send(format!("MESSAGE {sender_id} {message}\n"))
-            .await;
-    }
-}
-
 async fn leave_room(rooms: &Rooms, room_code: &str, client_id: &str) {
-    let mut rooms = rooms.lock().await;
-    let should_remove_room = if let Some(room) = rooms.get_mut(room_code) {
-        room.remove(client_id);
+    // lock 잡은 상태에서 await 하지 않기 위해
+    // sender들만 먼저 복사해둔다.
+    let remaining_senders = {
+        let mut rooms = rooms.lock().await;
+        let mut senders = Vec::new();
+        let mut remove_room = false;
 
-        for peer in room.values() {
-            let _ = peer.sender.send(format!("PEER_LEFT {client_id}\n")).await;
+        if let Some(room) = rooms.get_mut(room_code) {
+            room.remove(client_id);
+            senders = room.values().map(|peer| peer.sender.clone()).collect();
+            remove_room = room.is_empty();
         }
 
-        room.is_empty()
-    } else {
-        false
+        if remove_room {
+            rooms.remove(room_code);
+        }
+
+        senders
     };
 
-    if should_remove_room {
-        rooms.remove(room_code);
+    for sender in remaining_senders {
+        let _ = sender.send(format!("PEER_LEFT {client_id}\n")).await;
     }
 
-    println!("{client_id} left {room_code}");
+    println!("{client_id} left room {room_code}");
 }
 
 async fn write_messages(mut writer: OwnedWriteHalf, mut receiver: mpsc::Receiver<String>) {
@@ -194,32 +190,94 @@ async fn write_messages(mut writer: OwnedWriteHalf, mut receiver: mpsc::Receiver
     }
 }
 
-async fn register_udp(rooms: &Rooms, room_code: &str, client_id: &str, udp_addr: SocketAddr) {
-    let mut rooms = rooms.lock().await;
-    let Some(room) = rooms.get_mut(room_code) else {
-        return;
-    };
-    let Some(peer) = room.get_mut(client_id) else {
-        return;
-    };
+async fn handle_udp_registration(socket: UdpSocket, rooms: Rooms) -> io::Result<()> {
+    let mut buffer = [0u8; 1024];
 
-    peer.udp_addr = Some(udp_addr);
+    loop {
+        let (size, source_addr) = socket.recv_from(&mut buffer).await?;
+        let message = String::from_utf8_lossy(&buffer[..size]);
+        let message = message.trim();
+        let mut parts = message.split_whitespace();
 
-    println!("{client_id} registered UDP: {udp_addr}");
+        match parts.next() {
+            Some("REGISTER") => {
+                let Some(client_id) = parts.next() else {
+                    continue;
+                };
 
-    let ready_peers: Vec<(String, SocketAddr, ClientSender)> = room
-        .iter()
-        .filter_map(|(id, peer)| {
-            peer.udp_addr
-                .map(|addr| (id.clone(), addr, peer.sender.clone()))
-        })
-        .collect();
+                println!(
+                    "UDP REGISTER: \
+                     {client_id} -> \
+                     {source_addr}"
+                );
 
-    if ready_peers.len() == 2 {
-        let (_, addr_a, sender_a) = &ready_peers[0];
-        let (_, addr_b, sender_b) = &ready_peers[1];
-
-        let _ = sender_a.send(format!("PEER {addr_b}\n")).await;
-        let _ = sender_b.send(format!("PEER {addr_a}\n")).await;
+                register_udp_addr(&rooms, client_id, source_addr).await;
+            }
+            _ => {
+                println!(
+                    "Unknown UDP packet \
+                     from {source_addr}: \
+                     {message}"
+                );
+            }
+        }
     }
+}
+
+async fn register_udp_addr(rooms: &Rooms, client_id: &str, udp_addr: SocketAddr) {
+    // 여기서는 lock 안에서 room만 수정하고
+    // 실제 tx.send().await는 lock 해제 후 수행한다.
+    let peers_to_notify = {
+        let mut rooms = rooms.lock().await;
+        let mut result: Option<Vec<(ClientSender, SocketAddr)>> = None;
+
+        for (room_code, room) in rooms.iter_mut() {
+            let Some(peer) = room.get_mut(client_id) else {
+                continue;
+            };
+
+            peer.udp_addr = Some(udp_addr);
+
+            println!(
+                "{client_id} UDP registered \
+                 in room {room_code}: \
+                 {udp_addr}"
+            );
+
+            // 방에 정확히 2명이 있고
+            // 둘 다 UDP 주소가 준비되어야 함
+            if room.len() == 2 {
+                let ready: Vec<(ClientSender, SocketAddr)> = room
+                    .values()
+                    .filter_map(|peer| peer.udp_addr.map(|addr| (peer.sender.clone(), addr)))
+                    .collect();
+
+                if ready.len() == 2 {
+                    result = Some(ready);
+                }
+            }
+
+            break;
+        }
+
+        result
+    };
+
+    let Some(peers) = peers_to_notify else {
+        return;
+    };
+
+    let (sender_a, addr_a) = &peers[0];
+    let (sender_b, addr_b) = &peers[1];
+
+    println!(
+        "P2P candidates:\n\
+         A = {addr_a}\n\
+         B = {addr_b}"
+    );
+
+    // A에게 B 주소
+    let _ = sender_a.send(format!("PEER {addr_b}\n")).await;
+    // B에게 A 주소
+    let _ = sender_b.send(format!("PEER {addr_a}\n")).await;
 }
