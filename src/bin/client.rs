@@ -6,8 +6,8 @@ use tokio::{
     time::sleep,
 };
 
-const TCP_SERVER: &str = "127.0.0.1:9000";
-const UDP_SERVER: &str = "127.0.0.1:9001";
+const TCP_SERVER: &str = "p2psignal.mcv.kr:9000";
+const UDP_SERVER: &str = "p2psignal.mcv.kr:9001";
 const ROOM_CODE: &str = "ABC123";
 
 #[tokio::main]
