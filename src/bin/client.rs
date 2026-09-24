@@ -1,7 +1,15 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{lookup_host, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket, lookup_host},
     sync::RwLock,
     time::sleep,
 };
@@ -12,6 +20,8 @@ const ROOM_CODE: &str = "ABC123";
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let p2p_connected = Arc::new(AtomicBool::new(false));
+
     println!("Connecting to signaling server...");
 
     let tcp_stream = TcpStream::connect(TCP_SERVER).await?;
@@ -87,15 +97,10 @@ async fn main() -> io::Result<()> {
             )
         })?;
 
-    println!(
-        "UDP signaling server: {udp_server_addr}"
-    );
+    println!("UDP signaling server: {udp_server_addr}");
 
     udp_socket
-        .send_to(
-            register_message.as_bytes(),
-            udp_server_addr,
-        )
+        .send_to(register_message.as_bytes(), udp_server_addr)
         .await?;
 
     println!("UDP endpoint registration sent");
@@ -104,11 +109,12 @@ async fn main() -> io::Result<()> {
      * TCP signaling 수신 task
      */
     {
+        let p2p_connected_clone = Arc::clone(&p2p_connected);
         let peer_addr = Arc::clone(&peer_addr);
         let udp_socket = Arc::clone(&udp_socket);
 
         tokio::spawn(async move {
-            signaling_receive_loop(reader, peer_addr, udp_socket).await;
+            signaling_receive_loop(reader, peer_addr, udp_socket, p2p_connected_clone).await;
         });
     }
 
@@ -116,11 +122,12 @@ async fn main() -> io::Result<()> {
      * UDP 수신 task
      */
     {
+        let p2p_connected_clone = Arc::clone(&p2p_connected);
         let udp_socket = Arc::clone(&udp_socket);
         let peer_addr = Arc::clone(&peer_addr);
 
         tokio::spawn(async move {
-            udp_receive_loop(udp_socket, peer_addr).await;
+            udp_receive_loop(udp_socket, peer_addr, p2p_connected_clone).await;
         });
     }
 
@@ -222,6 +229,7 @@ async fn signaling_receive_loop<R>(
     mut reader: R,
     peer_addr: Arc<RwLock<Option<SocketAddr>>>,
     udp_socket: Arc<UdpSocket>,
+    p2p_connected: Arc<AtomicBool>,
 ) where
     R: AsyncBufReadExt + Unpin,
 {
@@ -262,13 +270,19 @@ async fn signaling_receive_loop<R>(
                          * A/B 둘 다 이 작업을 실행하면서
                          * 서로 동시에 UDP를 보내 NAT hole을 연다.
                          */
-                        start_hole_punching(Arc::clone(&udp_socket), addr);
+                        start_hole_punching(
+                            Arc::clone(&udp_socket),
+                            addr,
+                            Arc::clone(&p2p_connected),
+                        );
                     }
 
                     Some("PEER_LEFT") => {
                         let mut peer = peer_addr.write().await;
 
                         *peer = None;
+
+                        p2p_connected.store(false, Ordering::Relaxed);
 
                         println!("Peer disconnected");
                     }
@@ -285,15 +299,20 @@ async fn signaling_receive_loop<R>(
     }
 }
 
-fn start_hole_punching(udp_socket: Arc<UdpSocket>, peer_addr: SocketAddr) {
+fn start_hole_punching(
+    udp_socket: Arc<UdpSocket>,
+    peer_addr: SocketAddr,
+    p2p_connected: Arc<AtomicBool>,
+) {
     tokio::spawn(async move {
         println!("Starting hole punching...");
 
-        /*
-         * 첫 UDP 패킷은 NAT 상태 때문에
-         * 버려질 수 있어서 여러 번 보낸다.
-         */
         for attempt in 1..=10 {
+            if p2p_connected.load(Ordering::Relaxed) {
+                println!("Hole punching stopped: already connected");
+                break;
+            }
+
             match udp_socket.send_to(b"PUNCH", peer_addr).await {
                 Ok(_) => {
                     println!("PUNCH #{attempt} -> {peer_addr}");
@@ -309,7 +328,11 @@ fn start_hole_punching(udp_socket: Arc<UdpSocket>, peer_addr: SocketAddr) {
     });
 }
 
-async fn udp_receive_loop(udp_socket: Arc<UdpSocket>, peer_addr: Arc<RwLock<Option<SocketAddr>>>) {
+async fn udp_receive_loop(
+    udp_socket: Arc<UdpSocket>,
+    peer_addr: Arc<RwLock<Option<SocketAddr>>>,
+    p2p_connected: Arc<AtomicBool>,
+) {
     let mut buffer = [0u8; 2048];
 
     loop {
@@ -323,7 +346,6 @@ async fn udp_receive_loop(udp_socket: Arc<UdpSocket>, peer_addr: Arc<RwLock<Opti
         };
 
         let message = String::from_utf8_lossy(&buffer[..size]);
-
         match message.as_ref() {
             "PUNCH" => {
                 /*
@@ -332,10 +354,8 @@ async fn udp_receive_loop(udp_socket: Arc<UdpSocket>, peer_addr: Arc<RwLock<Opti
                  */
                 {
                     let mut peer = peer_addr.write().await;
-
                     *peer = Some(from);
                 }
-
                 println!("PUNCH received from {from}");
 
                 let _ = udp_socket.send_to(b"PUNCH_ACK", from).await;
@@ -344,10 +364,10 @@ async fn udp_receive_loop(udp_socket: Arc<UdpSocket>, peer_addr: Arc<RwLock<Opti
             "PUNCH_ACK" => {
                 {
                     let mut peer = peer_addr.write().await;
-
                     *peer = Some(from);
                 }
 
+                p2p_connected.store(true, Ordering::Relaxed);
                 println!("P2P connected: {from}");
             }
 
