@@ -1,3 +1,4 @@
+use rand::Rng;
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -89,12 +90,23 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> io::Result<()> {
         let mut parts = message.split_whitespace();
 
         match parts.next() {
+            Some("CREATE") => {
+                if current_room.is_some() {
+                    let _ = tx.send("ALREADY_IN_ROOM\n".to_string()).await;
+
+                    continue;
+                }
+
+                let room_code = create_room(&rooms, &client_id, tx.clone()).await;
+
+                current_room = Some(room_code);
+            }
+
             Some("JOIN") => {
-                // 이미 다른 방에 들어가 있다면 거절
-                // if current_room.is_some() {
-                //     let _ = tx.send("ALREADY_IN_ROOM\n".to_string()).await;
-                //     continue;
-                // }
+                if current_room.is_some() {
+                    let _ = tx.send("ALREADY_IN_ROOM\n".to_string()).await;
+                    continue;
+                }
 
                 let Some(room_code) = parts.next() else {
                     let _ = tx.send("ERROR INVALID_JOIN\n".to_string()).await;
@@ -123,6 +135,14 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> io::Result<()> {
                 let _ = tx.send("LEFT\n".to_string()).await;
             }
 
+            Some("P2P_FAILED") => {
+                let Some(room_code) = current_room.take() else {
+                    continue;
+                };
+
+                handle_p2p_failure(&rooms, &room_code, &client_id).await;
+            }
+
             _ => {
                 let _ = tx.send("ERROR UNKNOWN_COMMAND\n".to_string()).await;
             }
@@ -144,14 +164,15 @@ async fn join_room(
     sender: ClientSender,
 ) -> Result<(), &'static str> {
     let mut rooms = rooms.lock().await;
-    let room = rooms.entry(room_code.to_string()).or_default();
 
-    // 같은 client_id 중복 방어
+    let Some(room) = rooms.get_mut(room_code) else {
+        return Err("ROOM_NOT_FOUND");
+    };
+
     if room.contains_key(client_id) {
-        return Err("ALREADY_JOINED");
+        return Err("ALREADY_IN_ROOM");
     }
 
-    // 1:1 P2P이므로 최대 2명
     if room.len() >= 2 {
         return Err("ROOM_FULL");
     }
@@ -164,41 +185,55 @@ async fn join_room(
         },
     );
 
-    println!("{client_id} joined room {room_code}");
-
     drop(rooms);
 
     let _ = sender.send(format!("JOINED {room_code}\n")).await;
+    println!("{client_id} joined room {room_code}");
 
     Ok(())
 }
 
 async fn leave_room(rooms: &Rooms, room_code: &str, client_id: &str) {
-    // lock 잡은 상태에서 await 하지 않기 위해
-    // sender들만 먼저 복사해둔다.
-    let remaining_senders = {
-        let mut rooms = rooms.lock().await;
-        let mut senders = Vec::new();
-        let mut remove_room = false;
-
-        if let Some(room) = rooms.get_mut(room_code) {
-            room.remove(client_id);
-            senders = room.values().map(|peer| peer.sender.clone()).collect();
-            remove_room = room.is_empty();
-        }
-
-        if remove_room {
-            rooms.remove(room_code);
-        }
-
-        senders
-    };
+    let remaining_senders = remove_client_from_room(rooms, room_code, client_id).await;
 
     for sender in remaining_senders {
         let _ = sender.send(format!("PEER_LEFT {client_id}\n")).await;
     }
 
     println!("{client_id} left room {room_code}");
+}
+
+async fn handle_p2p_failure(rooms: &Rooms, room_code: &str, client_id: &str) {
+    let remaining_senders = remove_client_from_room(rooms, room_code, client_id).await;
+
+    for sender in remaining_senders {
+        let _ = sender.send("P2P_DISCONNECTED\n".to_string()).await;
+    }
+
+    println!("{client_id} P2P connection failed in room {room_code}");
+}
+
+async fn remove_client_from_room(
+    rooms: &Rooms,
+    room_code: &str,
+    client_id: &str,
+) -> Vec<ClientSender> {
+    // 공유 room lock을 잡은 상태에서는 channel send를 await하지 않는다.
+    let mut rooms = rooms.lock().await;
+    let mut senders = Vec::new();
+    let mut remove_room = false;
+
+    if let Some(room) = rooms.get_mut(room_code) {
+        room.remove(client_id);
+        senders = room.values().map(|peer| peer.sender.clone()).collect();
+        remove_room = room.is_empty();
+    }
+
+    if remove_room {
+        rooms.remove(room_code);
+    }
+
+    senders
 }
 
 async fn write_messages(mut writer: OwnedWriteHalf, mut receiver: mpsc::Receiver<String>) {
@@ -299,4 +334,55 @@ async fn register_udp_addr(rooms: &Rooms, client_id: &str, udp_addr: SocketAddr)
     let _ = sender_a.send(format!("PEER {addr_b}\n")).await;
     // B에게 A 주소
     let _ = sender_b.send(format!("PEER {addr_a}\n")).await;
+}
+
+async fn create_room(rooms: &Rooms, client_id: &str, sender: ClientSender) -> String {
+    let room_code = {
+        let mut rooms = rooms.lock().await;
+
+        let room_code = generate_unique_room_code(&rooms);
+
+        let mut room = HashMap::new();
+
+        room.insert(
+            client_id.to_string(),
+            Peer {
+                sender: sender.clone(),
+                udp_addr: None,
+            },
+        );
+
+        rooms.insert(room_code.clone(), room);
+
+        room_code
+    };
+
+    let _ = sender.send(format!("CREATED {room_code}\n")).await;
+
+    println!("{client_id} created room {room_code}");
+
+    room_code
+}
+
+fn generate_room_code() -> String {
+    const ROOM_CODE_CHARS: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::rng();
+
+    (0..6)
+        .map(|_| {
+            let index = rng.random_range(0..ROOM_CODE_CHARS.len());
+
+            ROOM_CODE_CHARS[index] as char
+        })
+        .collect()
+}
+
+fn generate_unique_room_code(rooms: &HashMap<String, Room>) -> String {
+    loop {
+        let code = generate_room_code();
+
+        if !rooms.contains_key(&code) {
+            return code;
+        }
+    }
 }
