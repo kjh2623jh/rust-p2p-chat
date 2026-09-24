@@ -71,10 +71,17 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> io::Result<()> {
 
     loop {
         let mut message = String::new();
-        let bytes_read = reader.read_line(&mut message).await?;
+
+        let bytes_read = match reader.read_line(&mut message).await {
+            Ok(size) => size,
+            Err(error) => {
+                eprintln!("Client connection error ({client_id}): {error}");
+                break;
+            }
+        };
 
         if bytes_read == 0 {
-            println!("TCP disconnected: {client_id}");
+            println!("Client disconnected: {client_id}");
             break;
         }
 
@@ -104,6 +111,18 @@ async fn handle_client(stream: TcpStream, rooms: Rooms) -> io::Result<()> {
                     }
                 }
             }
+
+            Some("LEAVE") => {
+                let Some(room_code) = current_room.take() else {
+                    let _ = tx.send("NOT_IN_ROOM\n".to_string()).await;
+                    continue;
+                };
+
+                leave_room(&rooms, &room_code, &client_id).await;
+
+                let _ = tx.send("LEFT\n".to_string()).await;
+            }
+
             _ => {
                 let _ = tx.send("ERROR UNKNOWN_COMMAND\n".to_string()).await;
             }

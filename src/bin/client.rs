@@ -145,6 +145,12 @@ async fn main() -> io::Result<()> {
             continue;
         }
 
+        if line.trim() == "/leave" {
+            writer.write_all(b"LEAVE\n").await?;
+            println!("방에서 나갔습니다.");
+            break;
+        }
+
         let peer = *peer_addr.read().await;
 
         let Some(peer) = peer else {
