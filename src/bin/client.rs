@@ -1,7 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpStream, UdpSocket},
+    net::{lookup_host, TcpStream, UdpSocket},
     sync::RwLock,
     time::sleep,
 };
@@ -77,8 +77,25 @@ async fn main() -> io::Result<()> {
      */
     let register_message = format!("REGISTER {client_id}");
 
+    let udp_server_addr = lookup_host(UDP_SERVER)
+        .await?
+        .find(|addr| addr.is_ipv4())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "UDP server IPv4 address not found",
+            )
+        })?;
+
+    println!(
+        "UDP signaling server: {udp_server_addr}"
+    );
+
     udp_socket
-        .send_to(register_message.as_bytes(), UDP_SERVER)
+        .send_to(
+            register_message.as_bytes(),
+            udp_server_addr,
+        )
         .await?;
 
     println!("UDP endpoint registration sent");
