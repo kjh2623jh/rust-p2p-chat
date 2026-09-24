@@ -10,7 +10,7 @@ use std::{
 use tokio::{
     io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpStream, UdpSocket, lookup_host},
-    sync::RwLock,
+    sync::{RwLock, mpsc},
     time::sleep,
 };
 
@@ -20,8 +20,6 @@ const ROOM_CODE: &str = "ABC123";
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let p2p_connected = Arc::new(AtomicBool::new(false));
-
     println!("Connecting to signaling server...");
 
     let tcp_stream = TcpStream::connect(TCP_SERVER).await?;
@@ -41,6 +39,8 @@ async fn main() -> io::Result<()> {
     let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     println!("Local UDP socket: {}", udp_socket.local_addr()?);
     let peer_addr: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
+    let p2p_connected = Arc::new(AtomicBool::new(false));
+    let (failed_tx, mut failed_rx) = mpsc::channel::<()>(1);
     let (reader, mut writer) = tcp_stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -114,7 +114,14 @@ async fn main() -> io::Result<()> {
         let udp_socket = Arc::clone(&udp_socket);
 
         tokio::spawn(async move {
-            signaling_receive_loop(reader, peer_addr, udp_socket, p2p_connected_clone).await;
+            signaling_receive_loop(
+                reader,
+                peer_addr,
+                udp_socket,
+                p2p_connected_clone,
+                failed_tx,
+            )
+            .await;
         });
     }
 
@@ -140,27 +147,58 @@ async fn main() -> io::Result<()> {
     println!();
     println!("메시지를 입력하세요.");
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else {
+                    break;
+                };
+
+                let line = line.trim();
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                if line == "/leave" {
+                    let _ = writer
+                        .write_all(b"LEAVE\n")
+                        .await;
+
+                    println!("방에서 나갑니다.");
+                    break;
+                }
+
+                let peer = *peer_addr.read().await;
+
+                let Some(peer) = peer else {
+                    println!("아직 P2P 연결 상대가 없습니다.");
+                    continue;
+                };
+
+                udp_socket.send_to(line.as_bytes(), peer).await?;
+
+                println!("[ME] {line}");
+            }
+
+            result = failed_rx.recv() => {
+                if result.is_some() {
+                    println!("P2P 연결에 실패했습니다.");
+
+                    let _ = writer.write_all(b"P2P_FAILED\n").await;
+
+                    break;
+                }
+            }
+
+            _ = tokio::signal::ctrl_c() => {
+                println!("종료 요청을 받았습니다.");
+
+                let _ = writer.write_all(b"LEAVE\n").await;
+
+                break;
+            }
         }
-
-        if line.trim() == "/leave" {
-            writer.write_all(b"LEAVE\n").await?;
-            println!("방에서 나갔습니다.");
-            break;
-        }
-
-        let peer = *peer_addr.read().await;
-
-        let Some(peer) = peer else {
-            println!("아직 P2P 연결 상대가 없습니다.");
-            continue;
-        };
-
-        udp_socket.send_to(line.as_bytes(), peer).await?;
-
-        println!("[ME] {line}");
     }
 
     Ok(())
@@ -236,6 +274,7 @@ async fn signaling_receive_loop<R>(
     peer_addr: Arc<RwLock<Option<SocketAddr>>>,
     udp_socket: Arc<UdpSocket>,
     p2p_connected: Arc<AtomicBool>,
+    failed_tx: mpsc::Sender<()>,
 ) where
     R: AsyncBufReadExt + Unpin,
 {
@@ -280,6 +319,7 @@ async fn signaling_receive_loop<R>(
                             Arc::clone(&udp_socket),
                             addr,
                             Arc::clone(&p2p_connected),
+                            failed_tx.clone(),
                         );
                     }
 
@@ -309,6 +349,7 @@ fn start_hole_punching(
     udp_socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     p2p_connected: Arc<AtomicBool>,
+    failed_tx: mpsc::Sender<()>,
 ) {
     tokio::spawn(async move {
         println!("Starting hole punching...");
@@ -316,20 +357,20 @@ fn start_hole_punching(
         for attempt in 1..=10 {
             if p2p_connected.load(Ordering::Relaxed) {
                 println!("Hole punching stopped: already connected");
-                break;
+                return;
             }
 
             match udp_socket.send_to(b"PUNCH", peer_addr).await {
-                Ok(_) => {
-                    println!("PUNCH #{attempt} -> {peer_addr}");
-                }
-
-                Err(error) => {
-                    eprintln!("Punch send error: {error}");
-                }
+                Ok(_) => println!("PUNCH #{attempt} -> {peer_addr}"),
+                Err(error) => eprintln!("Punch send error: {error}"),
             }
 
             sleep(Duration::from_millis(250)).await;
+        }
+
+        if !p2p_connected.load(Ordering::Relaxed) {
+            println!("P2P connection failed");
+            let _ = failed_tx.send(()).await;
         }
     });
 }
