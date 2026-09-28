@@ -3,7 +3,16 @@ name = "p2p-chat"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+client = ["dep:eframe"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 rand = "0.9"
-eframe = "0.36"
+eframe = { version = "0.36", optional = true }
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+required-features = ["client"]
