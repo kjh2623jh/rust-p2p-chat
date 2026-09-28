@@ -20,7 +20,12 @@ fn main() -> eframe::Result<()> {
         })
         .expect("failed to start network thread");
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([980.0, 720.0])
+            .with_min_inner_size([720.0, 540.0]),
+        ..Default::default()
+    };
 
     eframe::run_native(
         "P2P Chat",

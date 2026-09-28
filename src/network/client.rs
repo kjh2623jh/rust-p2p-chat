@@ -82,6 +82,20 @@ pub struct NetworkClient {
     command_rx: mpsc::Receiver<NetworkCommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
 }
+
+enum RunOutcome {
+    CommandChannelClosed,
+    ServerDisconnected,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl NetworkClient {
     pub fn new(
         command_rx: mpsc::Receiver<NetworkCommand>,
@@ -94,19 +108,32 @@ impl NetworkClient {
     }
 
     pub async fn run(mut self) {
-        if let Err(error) = self.run_inner().await {
-            eprintln!("Network error: {error}");
+        loop {
+            match self.run_inner().await {
+                Ok(RunOutcome::CommandChannelClosed) => return,
+                Ok(RunOutcome::ServerDisconnected) => {}
+                Err(error) => {
+                    eprintln!("Network error: {error}");
 
-            let _ = self
-                .event_tx
-                .send(NetworkEvent::Error(error.to_string()))
-                .await;
+                    let _ = self
+                        .event_tx
+                        .send(NetworkEvent::Error(error.to_string()))
+                        .await;
+                }
+            }
+
+            let _ = self.event_tx.send(NetworkEvent::ServerDisconnected).await;
+
+            if self.command_rx.is_closed() {
+                return;
+            }
+
+            println!("Retrying signaling connection in 3 seconds...");
+            sleep(Duration::from_secs(3)).await;
         }
-
-        let _ = self.event_tx.send(NetworkEvent::ServerDisconnected).await;
     }
 
-    async fn run_inner(&mut self) -> io::Result<()> {
+    async fn run_inner(&mut self) -> io::Result<RunOutcome> {
         println!("Connecting to signaling server...");
 
         let tcp_stream = TcpStream::connect(TCP_SERVER).await?;
@@ -178,15 +205,11 @@ impl NetworkClient {
          * PUNCH / PUNCH_ACK / 실제 채팅을
          * 계속 기다린다.
          */
-        {
-            let p2p_clone = p2p.clone();
-
-            let event_tx_clone = self.event_tx.clone();
-
-            tokio::spawn(async move {
-                udp_receive_loop(p2p_clone, event_tx_clone).await;
-            });
-        }
+        let p2p_clone = p2p.clone();
+        let event_tx_clone = self.event_tx.clone();
+        let _udp_receive_task = AbortOnDrop(tokio::spawn(async move {
+            udp_receive_loop(p2p_clone, event_tx_clone).await;
+        }));
 
         /*
          * 이 loop가 이제 예전의
@@ -210,7 +233,7 @@ impl NetworkClient {
                     let Some(command) =
                         command
                     else {
-                        break;
+                        return Ok(RunOutcome::CommandChannelClosed);
                     };
 
                     handle_command(command, &mut writer, &p2p, &self.event_tx).await?;
@@ -225,7 +248,7 @@ impl NetworkClient {
 
                     if size == 0 {
                         println!("Signaling server disconnected");
-                        break;
+                        return Ok(RunOutcome::ServerDisconnected);
                     }
 
                     self.handle_server_message(
@@ -234,6 +257,7 @@ impl NetworkClient {
                             &failed_tx,
                             &client_id,
                             udp_server_addr,
+                            &mut writer,
                         )
                         .await?;
                 }
@@ -272,8 +296,6 @@ impl NetworkClient {
                 }
             }
         }
-
-        Ok(())
     }
 
     async fn handle_server_message(
@@ -283,6 +305,7 @@ impl NetworkClient {
         failed_tx: &mpsc::Sender<(u64, SocketAddr)>,
         client_id: &str,
         udp_server_addr: SocketAddr,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
     ) -> io::Result<()> {
         println!("[SERVER] {message}");
 
@@ -333,6 +356,7 @@ impl NetworkClient {
 
             Some("PEER_LEFT") => {
                 p2p.reset().await;
+                writer.write_all(b"LEAVE\n").await?;
 
                 let _ = self.event_tx.send(NetworkEvent::PeerDisconnected).await;
             }
@@ -351,6 +375,7 @@ impl NetworkClient {
 
             Some("P2P_DISCONNECTED") => {
                 p2p.reset().await;
+                writer.write_all(b"LEAVE\n").await?;
 
                 let _ = self.event_tx.send(NetworkEvent::PeerDisconnected).await;
             }
