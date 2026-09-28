@@ -1,4 +1,4 @@
-name: Release Windows client
+name: Release desktop clients
 
 on:
   push:
@@ -9,7 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build-windows:
+    name: Build Windows x86_64
     runs-on: windows-latest
 
     steps:
@@ -27,13 +28,107 @@ jobs:
       - name: Prepare asset
         shell: pwsh
         run: |
-          $asset = "p2p-chat-$env:GITHUB_REF_NAME-windows-x86_64.exe"
+          New-Item -ItemType Directory -Force "dist" | Out-Null
+          $asset = "dist/p2p-chat-$env:GITHUB_REF_NAME-windows-x86_64.exe"
           Copy-Item "target/release/client.exe" $asset
 
+      - name: Upload Windows asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64
+          path: dist/*.exe
+          if-no-files-found: error
+
+  build-macos:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            asset_suffix: macos-aarch64
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_suffix: macos-x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build client
+        run: >-
+          cargo build --locked --release --features client --bin client
+          --target "${{ matrix.target }}"
+
+      - name: Package app bundle
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+        run: |
+          APP_DIR="dist/P2P Chat.app"
+          EXECUTABLE="$APP_DIR/Contents/MacOS/p2p-chat"
+          PLIST="$APP_DIR/Contents/Info.plist"
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          mkdir -p "$APP_DIR/Contents/MacOS"
+          cp "target/$TARGET/release/client" "$EXECUTABLE"
+          chmod +x "$EXECUTABLE"
+
+          /usr/bin/plutil -create xml1 "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDevelopmentRegion string ko" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string P2P Chat" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string p2p-chat" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.github.kjh2623jh.p2p-chat" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleName string P2P Chat" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 11.0" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST"
+
+          codesign --force --deep --sign - "$APP_DIR"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" \
+            "dist/p2p-chat-$GITHUB_REF_NAME-$ASSET_SUFFIX.zip"
+
+      - name: Upload macOS asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_suffix }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Create GitHub Release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          $asset = "p2p-chat-$env:GITHUB_REF_NAME-windows-x86_64.exe"
-          gh release create "$env:GITHUB_REF_NAME" $asset --generate-notes --verify-tag
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --generate-notes
+          --verify-tag
