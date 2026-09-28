@@ -1,0 +1,39 @@
+name: Release Windows client
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Build client
+        run: cargo build --locked --release --features client --bin client
+
+      - name: Prepare asset
+        shell: pwsh
+        run: |
+          $asset = "p2p-chat-$env:GITHUB_REF_NAME-windows-x86_64.exe"
+          Copy-Item "target/release/client.exe" $asset
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "p2p-chat-$env:GITHUB_REF_NAME-windows-x86_64.exe"
+          gh release create "$env:GITHUB_REF_NAME" $asset --generate-notes --verify-tag
