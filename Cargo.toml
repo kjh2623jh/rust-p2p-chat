@@ -21,7 +21,7 @@ zeroize = "1.8"
 tokio-rustls = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-eframe = { version = "0.36", optional = true }
+eframe = { version = "0.36", optional = true, features = ["glow"] }
 snow = { version = "0.10", optional = true, features = ["ring-resolver"] }
 webpki-roots = { version = "1", optional = true }
 
