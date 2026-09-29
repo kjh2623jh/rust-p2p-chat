@@ -1,16 +1,29 @@
 [package]
 name = "p2p-chat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [features]
 default = []
-client = ["dep:eframe"]
+client = [
+    "dep:eframe",
+    "dep:snow",
+    "dep:webpki-roots",
+]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 rand = "0.9"
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+zeroize = "1.8"
+tokio-rustls = "0.26"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eframe = { version = "0.36", optional = true }
+snow = { version = "0.10", optional = true, features = ["ring-resolver"] }
+webpki-roots = { version = "1", optional = true }
 
 [[bin]]
 name = "client"
