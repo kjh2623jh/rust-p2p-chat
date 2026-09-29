@@ -2,18 +2,26 @@ use std::{
     env,
     ffi::OsString,
     fmt,
-    fs::{self, OpenOptions},
+    fs::OpenOptions,
     io::{self, Write},
-    path::{Path, PathBuf},
-    process::{self, Command, ExitStatus},
+    path::PathBuf,
     str::FromStr,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
+};
+
+#[cfg(target_os = "windows")]
+use std::{
+    fs,
+    path::Path,
+    process::{self, Command, ExitStatus},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const RENDERER_ARGUMENT: &str = "--renderer";
 const READY_FILE_ARGUMENT: &str = "--renderer-ready-file";
 const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(2);
+#[cfg(target_os = "windows")]
 const WINDOWS_RENDERER_PRIORITY: [RendererMode; 3] =
     [RendererMode::Dx12, RendererMode::Glow, RendererMode::Vulkan];
 
@@ -40,6 +48,7 @@ impl RendererMode {
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn wgpu_backend(self) -> Option<&'static str> {
         match self {
             Self::Dx12 => Some("dx12"),
@@ -124,6 +133,7 @@ pub fn parse_invocation() -> io::Result<Invocation> {
     }
 }
 
+#[cfg(target_os = "windows")]
 pub fn run_launcher() -> io::Result<()> {
     let executable = env::current_exe()?;
     let mut failures = Vec::new();
@@ -178,11 +188,13 @@ pub fn schedule_ready_signal(ready_file: Option<PathBuf>) {
     });
 }
 
+#[cfg(target_os = "windows")]
 struct RendererOutcome {
     status: ExitStatus,
     reached_ready_state: bool,
 }
 
+#[cfg(target_os = "windows")]
 fn spawn_renderer(executable: &Path, mode: RendererMode) -> io::Result<RendererOutcome> {
     let ready_file = renderer_ready_file(mode);
     let mut command = Command::new(executable);
@@ -215,6 +227,7 @@ fn spawn_renderer(executable: &Path, mode: RendererMode) -> io::Result<RendererO
     })
 }
 
+#[cfg(target_os = "windows")]
 fn renderer_ready_file(mode: RendererMode) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -227,6 +240,7 @@ fn renderer_ready_file(mode: RendererMode) -> PathBuf {
     ))
 }
 
+#[cfg(target_os = "windows")]
 fn describe_exit_status(status: ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("code {code} (0x{:08X})", code as u32),
