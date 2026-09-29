@@ -85,21 +85,9 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build ${{ matrix.name }}
+    name: Build macOS Universal DMG
     needs: validate
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS Apple Silicon
-            runner: macos-latest
-            target: aarch64-apple-darwin
-            asset_suffix: macos-aarch64
-          - name: macOS Intel
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-            asset_suffix: macos-x86_64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15-intel
     permissions:
       contents: read
       id-token: write
@@ -116,7 +104,7 @@ jobs:
         run: |
           rustup update stable
           rustup default stable
-          rustup target add "${{ matrix.target }}"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Import Developer ID certificate
         env:
@@ -151,14 +139,16 @@ jobs:
           chmod 600 "$API_KEY_PATH"
           echo "API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
 
-      - name: Build client
-        run: >-
-          cargo build --locked --release --features client --bin client
-          --target "${{ matrix.target }}"
+      - name: Build both macOS architectures
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --features client --bin client \
+            --target aarch64-apple-darwin
+          cargo build --locked --release --features client --bin client \
+            --target x86_64-apple-darwin
 
-      - name: Package and sign app bundle
+      - name: Create and sign Universal app bundle
         env:
-          TARGET: ${{ matrix.target }}
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           APPLE_BUNDLE_ID: ${{ vars.APPLE_BUNDLE_ID }}
@@ -170,10 +160,16 @@ jobs:
           APP_DIR="dist/P2P Chat.app"
           EXECUTABLE="$APP_DIR/Contents/MacOS/p2p-chat"
           PLIST="$APP_DIR/Contents/Info.plist"
+          ARM64_BINARY="target/aarch64-apple-darwin/release/client"
+          X86_64_BINARY="target/x86_64-apple-darwin/release/client"
           VERSION="${GITHUB_REF_NAME#v}"
 
           mkdir -p "$APP_DIR/Contents/MacOS"
-          cp "target/$TARGET/release/client" "$EXECUTABLE"
+          test -x "$ARM64_BINARY"
+          test -x "$X86_64_BINARY"
+          lipo -create "$ARM64_BINARY" "$X86_64_BINARY" -output "$EXECUTABLE"
+          lipo "$EXECUTABLE" -verify_arch arm64 x86_64
+          lipo -info "$EXECUTABLE"
           chmod +x "$EXECUTABLE"
           /usr/bin/plutil -create xml1 "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleDevelopmentRegion string ko" "$PLIST"
@@ -189,13 +185,13 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST"
           codesign --force --deep --options runtime --timestamp \
             --sign "$APPLE_SIGNING_IDENTITY" "$APP_DIR"
+          codesign --verify --deep --strict --verbose=2 "$APP_DIR"
           codesign -dvv "$APP_DIR" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
 
-      - name: Notarize, staple, and verify
+      - name: Notarize and staple app bundle
         env:
           API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
         run: |
           set -euo pipefail
           test -n "$API_ISSUER_ID"
@@ -208,19 +204,45 @@ jobs:
           xcrun stapler validate "$APP_DIR"
           codesign --verify --deep --strict --verbose=2 "$APP_DIR"
           spctl --assess --type execute --verbose=2 "$APP_DIR"
-          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" \
-            "dist/p2p-chat-$GITHUB_REF_NAME-$ASSET_SUFFIX.zip"
 
-      - name: Attest macOS archive
+      - name: Create, sign, notarize, and staple DMG
+        env:
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          test -n "$API_ISSUER_ID"
+          test -n "$APPLE_SIGNING_IDENTITY"
+          APP_DIR="dist/P2P Chat.app"
+          DMG_ROOT="$RUNNER_TEMP/p2p-chat-dmg"
+          DMG_PATH="dist/p2p-chat-$GITHUB_REF_NAME-macos-universal.dmg"
+
+          mkdir -p "$DMG_ROOT"
+          ditto "$APP_DIR" "$DMG_ROOT/P2P Chat.app"
+          ln -s /Applications "$DMG_ROOT/Applications"
+          hdiutil create -volname "P2P Chat" -srcfolder "$DMG_ROOT" \
+            -ov -format UDZO "$DMG_PATH"
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
+          codesign --verify --verbose=2 "$DMG_PATH"
+          xcrun notarytool submit "$DMG_PATH" --wait \
+            --key "$API_KEY_PATH" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID"
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+          codesign --verify --verbose=2 "$DMG_PATH"
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=2 "$DMG_PATH"
+
+      - name: Attest macOS disk image
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: dist/*.zip
+          subject-path: dist/*.dmg
 
       - name: Upload macOS asset
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ matrix.asset_suffix }}
-          path: dist/*.zip
+          name: macos-universal
+          path: dist/*.dmg
           if-no-files-found: error
 
       - name: Remove signing material

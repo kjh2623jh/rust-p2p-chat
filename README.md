@@ -31,7 +31,7 @@ Let's Encrypt를 사용한다면 인증서 갱신 뒤 서버를 안전하게 재
 
 ## 릴리스
 
-`v*` 태그를 push하면 GitHub Actions가 테스트, Clippy, 의존성 감사를 수행한 뒤 Windows와 두 macOS 아키텍처를 빌드합니다. 성공한 결과는 즉시 공개되지 않고 **Draft Release**로 생성됩니다. v2 signaling 서버를 먼저 배포하고 서로 다른 외부 네트워크의 두 기기로 연결을 확인한 뒤 draft를 수동 공개하세요.
+`v*` 태그를 push하면 GitHub Actions가 테스트, Clippy, 의존성 감사를 수행한 뒤 Windows 실행 파일과 Apple Silicon·Intel을 모두 지원하는 macOS Universal DMG를 빌드합니다. 성공한 결과는 즉시 공개되지 않고 **Draft Release**로 생성됩니다. v2 signaling 서버를 먼저 배포하고 서로 다른 외부 네트워크의 두 기기로 연결을 확인한 뒤 draft를 수동 공개하세요.
 
 macOS 빌드에는 다음 GitHub Actions 설정이 필요합니다.
 
