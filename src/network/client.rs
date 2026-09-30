@@ -50,6 +50,8 @@ const PLAIN_HEARTBEAT: u8 = 5;
 const MAX_PENDING_MESSAGES: usize = 64;
 const MAX_HISTORY_DEDUP: usize = 512;
 const IPV4_FALLBACK_DELAY: Duration = Duration::from_millis(250);
+const PEER_IPV4_RETRY_DELAY: Duration = Duration::from_secs(3);
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum IpFamily {
@@ -287,6 +289,7 @@ struct SecurePeer {
     safety_number: Option<String>,
     local_nickname: String,
     peer_nickname: Option<String>,
+    last_ipv4_retry: Option<Instant>,
 }
 
 impl SecurePeer {
@@ -364,6 +367,7 @@ impl SecurePeer {
             safety_number: None,
             local_nickname,
             peer_nickname: None,
+            last_ipv4_retry: None,
         })
     }
 
@@ -675,12 +679,18 @@ impl NetworkClient {
                         let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
                         continue;
                     }
-                    if tick_peer(&mut peer, &udp, &self.event_tx).await? {
-                        writer.write_all(b"P2P_FAILED\n").await?;
-                        fail_pending(&mut peer, &self.event_tx, "상대방의 응답이 없습니다.").await;
-                        peer = None;
-                        room = None;
-                        let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
+                    match tick_peer(&mut peer, &udp, &self.event_tx).await? {
+                        PeerTickAction::Continue => {}
+                        PeerTickAction::RetryIpv4 => {
+                            writer.write_all(b"P2P_RETRY 4\n").await?;
+                        }
+                        PeerTickAction::Failed => {
+                            writer.write_all(b"P2P_FAILED\n").await?;
+                            fail_pending(&mut peer, &self.event_tx, "상대방의 응답이 없습니다.").await;
+                            peer = None;
+                            room = None;
+                            let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
+                        }
                     }
                 }
             }
@@ -944,7 +954,6 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
             }
             match SecurePeer::new(address, role == "I", room_context) {
                 Ok(new_peer) => {
-                    registration.attempts.clear();
                     *peer = Some(new_peer);
                 }
                 Err(error) => {
@@ -1315,17 +1324,45 @@ fn decode_ready_nickname(plaintext: &[u8]) -> Option<String> {
     normalize_nickname(nickname).filter(|normalized| normalized == nickname)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerTickAction {
+    Continue,
+    RetryIpv4,
+    Failed,
+}
+
+fn peer_connection_action(peer: &mut SecurePeer, now: Instant) -> PeerTickAction {
+    if peer.connected {
+        return PeerTickAction::Continue;
+    }
+    let elapsed = now.duration_since(peer.started_at);
+    if elapsed >= PEER_CONNECT_TIMEOUT {
+        return PeerTickAction::Failed;
+    }
+    if peer.address.is_ipv6()
+        && elapsed >= PEER_IPV4_RETRY_DELAY
+        && peer
+            .last_ipv4_retry
+            .is_none_or(|last_retry| now.duration_since(last_retry) >= Duration::from_secs(1))
+    {
+        peer.last_ipv4_retry = Some(now);
+        return PeerTickAction::RetryIpv4;
+    }
+    PeerTickAction::Continue
+}
+
 async fn tick_peer(
     peer: &mut Option<SecurePeer>,
     udp: &UdpSockets,
     event_tx: &mpsc::Sender<NetworkEvent>,
-) -> io::Result<bool> {
+) -> io::Result<PeerTickAction> {
     let Some(peer) = peer.as_mut() else {
-        return Ok(false);
+        return Ok(PeerTickAction::Continue);
     };
     let now = Instant::now();
-    if !peer.connected && now.duration_since(peer.started_at) > Duration::from_secs(10) {
-        return Ok(true);
+    let connection_action = peer_connection_action(peer, now);
+    if connection_action != PeerTickAction::Continue {
+        return Ok(connection_action);
     }
     if peer.transport.is_none()
         && now.duration_since(peer.last_handshake_send) >= Duration::from_millis(250)
@@ -1344,7 +1381,7 @@ async fn tick_peer(
     }
     if peer.connected && now.duration_since(peer.last_received) > Duration::from_secs(90) {
         let _ = event_tx.send(NetworkEvent::PeerDisconnected).await;
-        return Ok(true);
+        return Ok(PeerTickAction::Failed);
     }
     if peer.connected && now.duration_since(peer.last_heartbeat_send) >= Duration::from_secs(30) {
         let packet = peer
@@ -1392,7 +1429,7 @@ async fn tick_peer(
             },
         );
     }
-    Ok(false)
+    Ok(PeerTickAction::Continue)
 }
 
 fn encrypted_message_packet(
@@ -1715,5 +1752,63 @@ mod tests {
         assert!(decode_ready_nickname(&[PLAIN_READY]).is_none());
         assert!(decode_ready_nickname(&[PLAIN_READY, b'a', b'\n']).is_none());
         assert!(decode_ready_nickname(&[PLAIN_MESSAGE, b'a']).is_none());
+    }
+
+    #[test]
+    fn stalled_ipv6_peer_retries_ipv4_until_it_fails() {
+        let room = RoomContext {
+            security: RoomSecurity::Public,
+            room_id: [1; 16],
+            session_nonce: [2; 16],
+            local_nickname: "alice".to_owned(),
+        };
+        let address: SocketAddr = "[2001:db8::1]:40000".parse().unwrap();
+        let mut peer = SecurePeer::new(address, true, &room).unwrap();
+        let started_at = peer.started_at;
+
+        assert_eq!(
+            peer_connection_action(&mut peer, started_at + PEER_IPV4_RETRY_DELAY),
+            PeerTickAction::RetryIpv4
+        );
+        assert_eq!(
+            peer_connection_action(
+                &mut peer,
+                started_at + PEER_IPV4_RETRY_DELAY + Duration::from_millis(1)
+            ),
+            PeerTickAction::Continue
+        );
+        assert_eq!(
+            peer_connection_action(
+                &mut peer,
+                started_at + PEER_IPV4_RETRY_DELAY + Duration::from_secs(1)
+            ),
+            PeerTickAction::RetryIpv4
+        );
+        assert_eq!(
+            peer_connection_action(&mut peer, started_at + PEER_CONNECT_TIMEOUT),
+            PeerTickAction::Failed
+        );
+    }
+
+    #[test]
+    fn stalled_ipv4_peer_does_not_request_another_fallback() {
+        let room = RoomContext {
+            security: RoomSecurity::Public,
+            room_id: [1; 16],
+            session_nonce: [2; 16],
+            local_nickname: "alice".to_owned(),
+        };
+        let address: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        let mut peer = SecurePeer::new(address, true, &room).unwrap();
+        let started_at = peer.started_at;
+
+        assert_eq!(
+            peer_connection_action(&mut peer, started_at + PEER_IPV4_RETRY_DELAY),
+            PeerTickAction::Continue
+        );
+        assert_eq!(
+            peer_connection_action(&mut peer, started_at + PEER_CONNECT_TIMEOUT),
+            PeerTickAction::Failed
+        );
     }
 }

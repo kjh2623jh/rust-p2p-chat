@@ -168,8 +168,10 @@ type SharedState = Arc<Mutex<ServerState>>;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(log_filter)
         .with_target(false)
         .compact()
         .init();
@@ -515,6 +517,16 @@ async fn handle_client(
                 }
                 send_public_rooms(&state, &tx).await;
             }
+            Some("P2P_RETRY") => {
+                let retry_ipv4 = parts.next() == Some("4") && parts.next().is_none();
+                if !retry_ipv4 {
+                    let _ = tx.send("ERROR INVALID_COMMAND\n".to_owned()).await;
+                    continue;
+                }
+                if let Some(room_id) = current_room.as_deref() {
+                    retry_peer_family(&state, room_id, &client_id, IpFamily::V4).await;
+                }
+            }
             Some("LEAVE") | Some("P2P_FAILED") => {
                 if let Some(room_id) = current_room.take() {
                     leave_room(&state, &room_id, &client_id).await;
@@ -532,6 +544,58 @@ async fn handle_client(
     }
     state.lock().await.clients.remove(&client_id);
     Ok(())
+}
+
+async fn retry_peer_family(
+    state: &SharedState,
+    room_id: &str,
+    requesting_client_id: &str,
+    family: IpFamily,
+) {
+    let pair = {
+        let mut state = state.lock().await;
+        let Some(room) = state.rooms.get_mut(room_id) else {
+            return;
+        };
+        if room.peers.len() != 2
+            || !room.peers.contains_key(requesting_client_id)
+            || room.selected_family == Some(family)
+            || !room
+                .peers
+                .values()
+                .all(|peer| peer.endpoints.get(family).is_some())
+        {
+            return;
+        }
+        room.selected_family = Some(family);
+        let peers = room
+            .peers
+            .iter()
+            .map(|(id, peer)| {
+                (
+                    id.clone(),
+                    peer.sender.clone(),
+                    peer.endpoints.get(family).expect("common family checked"),
+                )
+            })
+            .collect::<Vec<_>>();
+        Some((room.creator.clone(), room.session_nonce, peers))
+    };
+
+    let Some((creator, nonce, peers)) = pair else {
+        return;
+    };
+    for (id, sender, _) in &peers {
+        let other = peers
+            .iter()
+            .find(|(other_id, _, _)| other_id != id)
+            .expect("two peers");
+        let role = if *id == creator { "I" } else { "R" };
+        let _ = sender
+            .send(format!("PEER {} {role} {}\n", other.2, encode_hex(&nonce)))
+            .await;
+    }
+    info!(room = %short_id(room_id), ?family, "peer endpoints retried");
 }
 
 async fn create_room(
@@ -1181,6 +1245,56 @@ mod tests {
             select_common_family([&first, &second].into_iter()),
             Some(IpFamily::V6)
         );
+    }
+
+    #[tokio::test]
+    async fn ipv4_retry_reissues_peer_endpoints_without_leaving_room() {
+        let state = Arc::new(Mutex::new(ServerState::default()));
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        let mut first_endpoints = PeerEndpoints::default();
+        first_endpoints.insert("198.51.100.1:40000".parse().unwrap());
+        first_endpoints.insert("[2001:db8::1]:40000".parse().unwrap());
+        let mut second_endpoints = PeerEndpoints::default();
+        second_endpoints.insert("198.51.100.2:40001".parse().unwrap());
+        second_endpoints.insert("[2001:db8::2]:40001".parse().unwrap());
+        state.lock().await.rooms.insert(
+            "room".to_owned(),
+            Room {
+                creator: "first".to_owned(),
+                kind: RoomKind::Private,
+                session_nonce: [7; 16],
+                created_at: Instant::now(),
+                peers: HashMap::from([
+                    (
+                        "first".to_owned(),
+                        Peer {
+                            sender: first_tx,
+                            endpoints: first_endpoints,
+                        },
+                    ),
+                    (
+                        "second".to_owned(),
+                        Peer {
+                            sender: second_tx,
+                            endpoints: second_endpoints,
+                        },
+                    ),
+                ]),
+                selected_family: Some(IpFamily::V6),
+            },
+        );
+
+        retry_peer_family(&state, "room", "first", IpFamily::V4).await;
+
+        let first_message = first_rx.recv().await.unwrap();
+        let second_message = second_rx.recv().await.unwrap();
+        assert!(first_message.starts_with("PEER 198.51.100.2:40001 I "));
+        assert!(second_message.starts_with("PEER 198.51.100.1:40000 R "));
+        let state = state.lock().await;
+        let room = state.rooms.get("room").unwrap();
+        assert_eq!(room.selected_family, Some(IpFamily::V4));
+        assert_eq!(room.peers.len(), 2);
     }
 
     #[test]
