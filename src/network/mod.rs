@@ -17,7 +17,7 @@ pub enum NetworkEvent {
     ServerDisconnected,
 
     RoomCreated { invite: String, fingerprint: String },
-    JoinedRoom { fingerprint: String },
+    JoinedRoom { invite: String, fingerprint: String },
 
     RoomFull,
     RoomNotFound,
@@ -25,6 +25,7 @@ pub enum NetworkEvent {
 
     PeerConnected,
     PeerDisconnected,
+    RoomExpired,
 
     P2pFailed,
 

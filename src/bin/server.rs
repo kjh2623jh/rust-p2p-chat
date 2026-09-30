@@ -380,7 +380,14 @@ async fn leave_room(state: &SharedState, room_id: &str, client_id: &str) {
         let Some(room) = state.rooms.get_mut(room_id) else {
             return;
         };
+        let departing_creator = room.creator == client_id;
         room.peers.remove(client_id);
+        if let Some(remaining_client_id) = room.peers.keys().next().cloned() {
+            if departing_creator {
+                room.creator = remaining_client_id;
+            }
+            room.created_at = Instant::now();
+        }
         let senders = room
             .peers
             .values()
@@ -811,5 +818,36 @@ mod tests {
             !authenticate_registration(&state, client_id, source, client_nonce, server_nonce, tag,)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn remaining_peer_keeps_room_and_becomes_creator() {
+        let state = Arc::new(Mutex::new(ServerState::default()));
+        let room_id = "00112233445566778899aabbccddeeff";
+        let (creator_tx, _creator_rx) = mpsc::channel(4);
+        let (joiner_tx, _joiner_rx) = mpsc::channel(4);
+        let (replacement_tx, _replacement_rx) = mpsc::channel(4);
+
+        create_room(&state, room_id, "creator", creator_tx)
+            .await
+            .expect("room creation should succeed");
+        join_room(&state, room_id, "joiner", joiner_tx)
+            .await
+            .expect("first join should succeed");
+
+        leave_room(&state, room_id, "creator").await;
+
+        {
+            let state = state.lock().await;
+            let room = state.rooms.get(room_id).expect("room should remain");
+            assert_eq!(room.creator, "joiner");
+            assert_eq!(room.peers.len(), 1);
+            assert!(room.peers.contains_key("joiner"));
+        }
+
+        join_room(&state, room_id, "replacement", replacement_tx)
+            .await
+            .expect("replacement peer should be able to join");
+        assert_eq!(state.lock().await.rooms[room_id].peers.len(), 2);
     }
 }

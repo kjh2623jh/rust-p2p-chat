@@ -1,6 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
-use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText, Stroke};
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, Layout, Margin, RichText, Stroke, StrokeKind,
+};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use zeroize::Zeroize;
 
@@ -72,6 +74,8 @@ pub struct ChatApp {
     last_network_error: Option<String>,
     focus_room_code: bool,
     focus_message: bool,
+    confirm_leave: bool,
+    focus_leave_cancel: bool,
 }
 
 impl ChatApp {
@@ -102,6 +106,8 @@ impl ChatApp {
             last_network_error: None,
             focus_room_code: false,
             focus_message: false,
+            confirm_leave: false,
+            focus_leave_cancel: false,
         }
     }
 
@@ -154,8 +160,11 @@ impl ChatApp {
                         "보안 초대 코드를 복사해 상대방에게 전달해 주세요.",
                     );
                 }
-                NetworkEvent::JoinedRoom { fingerprint } => {
-                    self.enter_room(fingerprint.clone(), None);
+                NetworkEvent::JoinedRoom {
+                    invite,
+                    fingerprint,
+                } => {
+                    self.enter_room(fingerprint.clone(), Some(invite));
                     self.set_notice(
                         NoticeTone::Info,
                         format!("대화 {fingerprint}에 입장했습니다"),
@@ -205,11 +214,23 @@ impl ChatApp {
                     }
                 }
                 NetworkEvent::PeerDisconnected => {
+                    if self.current_room.is_some() {
+                        self.peer_connected = false;
+                        self.message_input.clear();
+                        self.focus_message = false;
+                        self.set_notice(
+                            NoticeTone::Warning,
+                            "상대방이 방을 나갔습니다",
+                            "방과 보안 초대 코드는 유지됩니다. 같은 코드를 공유해 새 상대방을 기다릴 수 있습니다.",
+                        );
+                    }
+                }
+                NetworkEvent::RoomExpired => {
                     self.reset_room_state();
                     self.set_notice(
                         NoticeTone::Warning,
-                        "상대방과 연결이 종료되었습니다",
-                        "기존 방을 안전하게 정리했습니다. 새 대화를 바로 시작할 수 있습니다.",
+                        "방의 대기 시간이 만료되었습니다",
+                        "새 방을 만들거나 다른 보안 초대 코드로 입장해 주세요.",
                     );
                     self.focus_room_code = true;
                 }
@@ -296,6 +317,8 @@ impl ChatApp {
         self.room_request_pending = false;
         self.peer_connected = false;
         self.message_input.clear();
+        self.confirm_leave = false;
+        self.focus_leave_cancel = false;
     }
 
     fn trim_history(&mut self) {
@@ -473,22 +496,22 @@ impl ChatApp {
             });
 
             ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
-                if room_fingerprint.is_some()
-                    && ui
-                        .add(
-                            egui::Button::new(RichText::new("방 나가기").color(ERROR))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(1.0, ERROR.gamma_multiply(0.55)))
-                                .corner_radius(CornerRadius::same(6)),
-                        )
-                        .clicked()
-                {
-                    self.leave_room();
-                    return;
+                if room_fingerprint.is_some() {
+                    let leave_response = ui.add(
+                        egui::Button::new(RichText::new("방 나가기").color(ERROR))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::new(1.0, ERROR.gamma_multiply(0.55)))
+                            .corner_radius(CornerRadius::same(6)),
+                    );
+                    paint_focus_ring(ui, &leave_response, 6);
+                    if leave_response.clicked() {
+                        self.confirm_leave = true;
+                        self.focus_leave_cancel = true;
+                    }
                 }
 
-                if let Some(invite) = invite
-                    && ui
+                if let Some(invite) = invite {
+                    let copy_response = ui
                         .add(
                             egui::Button::new(
                                 RichText::new("보안 초대 코드 복사").strong().color(TEXT),
@@ -497,19 +520,22 @@ impl ChatApp {
                             .stroke(Stroke::new(1.0, BORDER))
                             .corner_radius(CornerRadius::same(6)),
                         )
-                        .on_hover_text("전체 초대 코드를 클립보드에 복사")
-                        .clicked()
-                {
-                    ui.ctx().copy_text(invite);
-                    self.set_notice(
-                        NoticeTone::Success,
-                        "보안 초대 코드를 복사했습니다",
-                        "신뢰할 수 있는 방법으로 상대방에게 전달해 주세요.",
-                    );
+                        .on_hover_text("전체 초대 코드를 클립보드에 복사");
+                    paint_focus_ring(ui, &copy_response, 6);
+                    if copy_response.clicked() {
+                        ui.ctx().copy_text(invite);
+                        self.set_notice(
+                            NoticeTone::Success,
+                            "보안 초대 코드를 복사했습니다",
+                            "신뢰할 수 있는 방법으로 상대방에게 전달해 주세요.",
+                        );
+                    }
                 }
 
                 if self.peer_connected {
                     status_pill(ui, "상대방 연결됨", SUCCESS);
+                } else if room_fingerprint.is_some() {
+                    status_pill(ui, "상대방 대기 중", WARNING);
                 }
 
                 if let Some(fingerprint) = room_fingerprint {
@@ -542,14 +568,14 @@ impl ChatApp {
                     });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
+                        let close_response = ui
                             .add(
                                 egui::Button::new(RichText::new("닫기").size(11.0).color(MUTED))
                                     .frame(false),
                             )
-                            .on_hover_text("알림 닫기")
-                            .clicked()
-                        {
+                            .on_hover_text("알림 닫기");
+                        paint_focus_ring(ui, &close_response, 4);
+                        if close_response.clicked() {
                             self.notice = None;
                         }
                     });
@@ -576,7 +602,7 @@ impl ChatApp {
                         ui.label(RichText::new("새 방 만들기").size(15.0).strong());
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new("추측하기 어려운 일회성 보안 초대 코드를 만듭니다.")
+                            RichText::new("방이 열려 있는 동안 다시 사용할 수 있는 보안 초대 코드를 만듭니다.")
                                 .size(11.0)
                                 .color(MUTED),
                         );
@@ -598,6 +624,7 @@ impl ChatApp {
                             .corner_radius(CornerRadius::same(6))
                             .min_size(egui::vec2(150.0, 42.0)),
                         );
+                        paint_focus_ring(ui, &create_response, 6);
 
                         if create_response.clicked() {
                             self.create_room();
@@ -636,11 +663,12 @@ impl ChatApp {
                                 response.request_focus();
                                 self.focus_room_code = false;
                             }
+                            paint_focus_ring(ui, &response, 6);
 
-                            let enter_pressed = response.has_focus()
+                            let enter_pressed = response.lost_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter));
                             let can_join = enabled && self.room_code.trim().parse::<InviteCode>().is_ok();
-                            let join_clicked = ui
+                            let join_response = ui
                                 .add_enabled(
                                     can_join,
                                     egui::Button::new(RichText::new("입장").strong())
@@ -648,11 +676,14 @@ impl ChatApp {
                                         .stroke(Stroke::new(1.0, BORDER))
                                         .corner_radius(CornerRadius::same(6))
                                         .min_size(egui::vec2(join_button_width, 42.0)),
-                                )
-                                .clicked();
+                                );
+                            paint_focus_ring(ui, &join_response, 6);
+                            let join_clicked = join_response.clicked();
 
                             if (enter_pressed && can_join) || join_clicked {
                                 self.join_room();
+                            } else if enter_pressed {
+                                self.focus_room_code = true;
                             }
                         });
 
@@ -770,26 +801,104 @@ impl ChatApp {
                         response.request_focus();
                         self.focus_message = false;
                     }
+                    paint_focus_ring(ui, &response, 6);
 
-                    let enter_pressed = response.has_focus()
+                    let enter_pressed = response.lost_focus()
                         && ui.input(|input| input.key_pressed(egui::Key::Enter));
                     let can_send = self.peer_connected && !self.message_input.trim().is_empty();
-                    let send_clicked = ui
-                        .add_enabled(
-                            can_send,
-                            egui::Button::new(RichText::new("전송").strong().color(Color32::WHITE))
-                                .fill(PRIMARY)
-                                .stroke(Stroke::NONE)
-                                .corner_radius(CornerRadius::same(6))
-                                .min_size(egui::vec2(send_button_width, 42.0)),
-                        )
-                        .clicked();
+                    let send_response = ui.add_enabled(
+                        can_send,
+                        egui::Button::new(RichText::new("전송").strong().color(Color32::WHITE))
+                            .fill(PRIMARY)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(CornerRadius::same(6))
+                            .min_size(egui::vec2(send_button_width, 42.0)),
+                    );
+                    paint_focus_ring(ui, &send_response, 6);
+                    let send_clicked = send_response.clicked();
 
                     if (enter_pressed && can_send) || send_clicked {
                         self.send_message();
+                    } else if enter_pressed {
+                        self.focus_message = true;
                     }
                 });
             });
+    }
+
+    fn render_leave_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.confirm_leave {
+            return;
+        }
+
+        let mut cancel = false;
+        let mut confirm = false;
+        let modal = egui::Modal::new(egui::Id::new("leave-room-confirmation"))
+            .backdrop_color(Color32::from_black_alpha(180))
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(20)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.label(
+                    RichText::new("방에서 나갈까요?")
+                        .size(18.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "나가면 현재 기기에서는 이 대화와 초대 코드를 다시 사용할 수 없습니다.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(18.0);
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let leave_response = ui.add(
+                        egui::Button::new(RichText::new("나가기").strong().color(Color32::WHITE))
+                            .fill(ERROR)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(CornerRadius::same(6))
+                            .min_size(egui::vec2(88.0, 40.0)),
+                    );
+                    paint_focus_ring(ui, &leave_response, 6);
+                    confirm = leave_response.clicked();
+
+                    let cancel_response = ui.add(
+                        egui::Button::new(RichText::new("취소").strong().color(TEXT))
+                            .fill(SURFACE_RAISED)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .corner_radius(CornerRadius::same(6))
+                            .min_size(egui::vec2(88.0, 40.0)),
+                    );
+                    if self.focus_leave_cancel {
+                        cancel_response.request_focus();
+                        self.focus_leave_cancel = false;
+                    }
+                    paint_focus_ring(ui, &cancel_response, 6);
+                    cancel = cancel_response.clicked();
+                });
+            });
+
+        if modal.backdrop_response.clicked()
+            || ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            cancel = true;
+        }
+
+        if confirm {
+            self.confirm_leave = false;
+            self.leave_room();
+        } else if cancel {
+            self.confirm_leave = false;
+        }
     }
 }
 
@@ -844,6 +953,17 @@ fn status_pill(ui: &mut egui::Ui, label: &str, color: Color32) {
         .show(ui, |ui| {
             ui.label(RichText::new(label).size(11.0).color(color));
         });
+}
+
+fn paint_focus_ring(ui: &egui::Ui, response: &egui::Response, corner_radius: u8) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.expand(2.0),
+            CornerRadius::same(corner_radius),
+            Stroke::new(2.0, PRIMARY_HOVER),
+            StrokeKind::Outside,
+        );
+    }
 }
 
 fn tone_color(tone: NoticeTone) -> Color32 {
@@ -944,5 +1064,7 @@ impl eframe::App for ChatApp {
                     }
                 });
         });
+
+        self.render_leave_confirmation(ui.ctx());
     }
 }

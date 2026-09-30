@@ -520,7 +520,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 return Ok(ServerAction::Continue);
             }
             let fingerprint = invite.fingerprint();
-            let exposed = created.then(|| invite.expose());
+            let exposed = invite.expose();
             *room = Some(RoomContext {
                 invite,
                 room_id,
@@ -537,16 +537,19 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 udp_server,
             )
             .await?;
-            if let Some(invite) = exposed {
+            if created {
                 let _ = event_tx
                     .send(NetworkEvent::RoomCreated {
-                        invite,
+                        invite: exposed,
                         fingerprint,
                     })
                     .await;
             } else {
                 let _ = event_tx
-                    .send(NetworkEvent::JoinedRoom { fingerprint })
+                    .send(NetworkEvent::JoinedRoom {
+                        invite: exposed,
+                        fingerprint,
+                    })
                     .await;
             }
         }
@@ -612,13 +615,19 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 }
             }
         }
-        Some("PEER_LEFT") | Some("ROOM_EXPIRED") => {
-            writer.write_all(b"LEAVE\n").await?;
+        Some("PEER_LEFT") => {
             fail_pending(peer, event_tx, "상대방과 연결이 종료되었습니다.").await;
             *registration = None;
             *peer = None;
-            *room = None;
             let _ = event_tx.send(NetworkEvent::PeerDisconnected).await;
+        }
+        Some("ROOM_EXPIRED") => {
+            writer.write_all(b"LEAVE\n").await?;
+            fail_pending(peer, event_tx, "대화방의 대기 시간이 만료되었습니다.").await;
+            *registration = None;
+            *peer = None;
+            *room = None;
+            let _ = event_tx.send(NetworkEvent::RoomExpired).await;
         }
         Some("ROOM_FULL") => {
             *pending_invite = None;
