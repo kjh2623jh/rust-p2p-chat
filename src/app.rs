@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, RichText, Stroke, StrokeKind,
@@ -6,8 +9,11 @@ use eframe::egui::{
 use tokio::sync::mpsc::{self, error::TrySendError};
 use zeroize::Zeroize;
 
-use crate::network::{NetworkCommand, NetworkEvent};
-use crate::protocol::{InviteCode, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS};
+use crate::network::{NetworkCommand, NetworkEvent, PublicRoomSummary};
+use crate::protocol::{
+    InviteCode, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS, MAX_PUBLIC_ROOM_TITLE_CHARS,
+    normalize_public_room_title,
+};
 
 const BACKGROUND: Color32 = Color32::from_rgb(7, 7, 8);
 const TOP_BAR: Color32 = Color32::from_rgb(18, 18, 18);
@@ -29,6 +35,12 @@ enum NoticeTone {
     Success,
     Warning,
     Error,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoomVisibility {
+    Public,
+    Private,
 }
 
 #[derive(Clone)]
@@ -66,7 +78,14 @@ pub struct ChatApp {
     room_request_pending: bool,
     current_room: Option<String>,
     current_invite: Option<String>,
+    current_room_public: bool,
+    safety_number: Option<String>,
     peer_connected: bool,
+    room_visibility: RoomVisibility,
+    public_room_title: String,
+    public_rooms: Vec<PublicRoomSummary>,
+    public_list_pending: bool,
+    last_public_refresh: Option<Instant>,
     room_code: String,
     message_input: String,
     messages: Vec<ChatMessage>,
@@ -94,7 +113,14 @@ impl ChatApp {
             room_request_pending: false,
             current_room: None,
             current_invite: None,
+            current_room_public: false,
+            safety_number: None,
             peer_connected: false,
+            room_visibility: RoomVisibility::Public,
+            public_room_title: String::new(),
+            public_rooms: Vec::new(),
+            public_list_pending: false,
+            last_public_refresh: None,
             room_code: String::new(),
             message_input: String::new(),
             messages: Vec::new(),
@@ -125,6 +151,7 @@ impl ChatApp {
                     self.server_connected = true;
                     self.room_request_pending = false;
                     self.last_network_error = None;
+                    self.last_public_refresh = None;
                     self.set_notice(
                         NoticeTone::Success,
                         "서버 연결 완료",
@@ -135,6 +162,8 @@ impl ChatApp {
                 NetworkEvent::ServerDisconnected => {
                     self.reset_room_state();
                     self.server_connected = false;
+                    self.public_rooms.clear();
+                    self.public_list_pending = false;
                     let detail = self
                         .last_network_error
                         .take()
@@ -153,7 +182,7 @@ impl ChatApp {
                     invite,
                     fingerprint,
                 } => {
-                    self.enter_room(fingerprint.clone(), Some(invite));
+                    self.enter_room(fingerprint.clone(), Some(invite), false);
                     self.set_notice(
                         NoticeTone::Info,
                         format!("대화 {fingerprint}을 만들었습니다"),
@@ -164,12 +193,34 @@ impl ChatApp {
                     invite,
                     fingerprint,
                 } => {
-                    self.enter_room(fingerprint.clone(), Some(invite));
+                    self.enter_room(fingerprint.clone(), Some(invite), false);
                     self.set_notice(
                         NoticeTone::Info,
                         format!("대화 {fingerprint}에 입장했습니다"),
                         "초대 코드를 확인하고 종단간 암호화 연결을 설정하고 있습니다.",
                     );
+                }
+                NetworkEvent::PublicRoomCreated { room_id: _, title } => {
+                    self.enter_room(title.clone(), None, true);
+                    self.public_room_title.clear();
+                    self.set_notice(
+                        NoticeTone::Info,
+                        format!("공개방 ‘{title}’을 만들었습니다"),
+                        "목록에서 상대방이 입장하기를 기다리고 있습니다.",
+                    );
+                }
+                NetworkEvent::PublicRoomJoined { room_id: _, title } => {
+                    self.enter_room(title.clone(), None, true);
+                    self.set_notice(
+                        NoticeTone::Info,
+                        format!("공개방 ‘{title}’에 입장했습니다"),
+                        "암호화 연결을 설정하고 있습니다. 연결 후 안전번호를 비교해 주세요.",
+                    );
+                }
+                NetworkEvent::PublicRooms(rooms) => {
+                    self.public_rooms = rooms;
+                    self.public_list_pending = false;
+                    self.last_public_refresh = Some(Instant::now());
                 }
                 NetworkEvent::RoomFull => {
                     self.room_request_pending = false;
@@ -189,6 +240,24 @@ impl ChatApp {
                     );
                     self.focus_room_code = true;
                 }
+                NetworkEvent::PublicRoomFull => {
+                    self.room_request_pending = false;
+                    self.last_public_refresh = None;
+                    self.set_notice(
+                        NoticeTone::Warning,
+                        "방이 방금 가득 찼습니다",
+                        "목록을 갱신했습니다. 자리가 생기면 다시 입장할 수 있습니다.",
+                    );
+                }
+                NetworkEvent::PublicRoomNotFound => {
+                    self.room_request_pending = false;
+                    self.last_public_refresh = None;
+                    self.set_notice(
+                        NoticeTone::Warning,
+                        "공개방이 종료되었습니다",
+                        "방 목록을 갱신해 현재 입장 가능한 방을 보여드릴게요.",
+                    );
+                }
                 NetworkEvent::AlreadyInRoom => {
                     self.room_request_pending = false;
 
@@ -202,26 +271,42 @@ impl ChatApp {
                         self.focus_room_code = true;
                     }
                 }
-                NetworkEvent::PeerConnected => {
+                NetworkEvent::PeerConnected { safety_number } => {
                     if self.current_room.is_some() {
                         self.peer_connected = true;
-                        self.set_notice(
-                            NoticeTone::Success,
-                            "P2P 연결 완료",
-                            "메시지는 서버를 거치지 않고 상대방에게 직접 전송됩니다.",
-                        );
+                        self.safety_number = safety_number.clone();
+                        if let Some(number) = safety_number {
+                            self.set_notice(
+                                NoticeTone::Success,
+                                "공개방 P2P 연결 완료",
+                                format!(
+                                    "안전번호 {number}가 상대 화면과 같은지 다른 채널로 확인하세요."
+                                ),
+                            );
+                        } else {
+                            self.set_notice(
+                                NoticeTone::Success,
+                                "P2P 연결 완료",
+                                "메시지는 서버를 거치지 않고 상대방에게 직접 전송됩니다.",
+                            );
+                        }
                         self.focus_message = true;
                     }
                 }
                 NetworkEvent::PeerDisconnected => {
                     if self.current_room.is_some() {
                         self.peer_connected = false;
+                        self.safety_number = None;
                         self.message_input.clear();
                         self.focus_message = false;
                         self.set_notice(
                             NoticeTone::Warning,
                             "상대방이 방을 나갔습니다",
-                            "방과 보안 초대 코드는 유지됩니다. 같은 코드를 공유해 새 상대방을 기다릴 수 있습니다.",
+                            if self.current_room_public {
+                                "공개방은 목록에 다시 활성화되어 새 상대방이 입장할 수 있습니다."
+                            } else {
+                                "방과 보안 초대 코드는 유지됩니다. 같은 코드를 공유해 새 상대방을 기다릴 수 있습니다."
+                            },
                         );
                     }
                 }
@@ -286,6 +371,7 @@ impl ChatApp {
                 }
                 NetworkEvent::Error(error) => {
                     self.room_request_pending = false;
+                    self.public_list_pending = false;
                     let error = error.to_string();
                     self.last_network_error = Some(error.clone());
                     self.set_notice(
@@ -298,9 +384,11 @@ impl ChatApp {
         }
     }
 
-    fn enter_room(&mut self, fingerprint: String, invite: Option<String>) {
-        self.current_room = Some(fingerprint);
+    fn enter_room(&mut self, room_name: String, invite: Option<String>, public: bool) {
+        self.current_room = Some(room_name);
         self.current_invite = invite;
+        self.current_room_public = public;
+        self.safety_number = None;
         self.room_code.zeroize();
         self.room_request_pending = false;
         self.peer_connected = false;
@@ -310,6 +398,8 @@ impl ChatApp {
 
     fn reset_room_state(&mut self) {
         self.current_room = None;
+        self.current_room_public = false;
+        self.safety_number = None;
         if let Some(mut invite) = self.current_invite.take() {
             invite.zeroize();
         }
@@ -365,13 +455,57 @@ impl ChatApp {
     }
 
     fn create_room(&mut self) {
-        if self.send_command(NetworkCommand::CreateRoom) {
+        let command = match self.room_visibility {
+            RoomVisibility::Private => NetworkCommand::CreateRoom,
+            RoomVisibility::Public => {
+                let Some(title) = normalize_public_room_title(&self.public_room_title) else {
+                    self.set_notice(
+                        NoticeTone::Warning,
+                        "공개방 이름을 확인해 주세요",
+                        format!("공개방 이름은 1~{MAX_PUBLIC_ROOM_TITLE_CHARS}자로 입력해 주세요."),
+                    );
+                    return;
+                };
+                NetworkCommand::CreatePublicRoom(title)
+            }
+        };
+        if self.send_command(command) {
             self.room_request_pending = true;
             self.set_notice(
                 NoticeTone::Info,
                 "방을 만드는 중입니다",
                 "서버의 응답을 기다리고 있습니다.",
             );
+        }
+    }
+
+    fn join_public_room(&mut self, room: &PublicRoomSummary) {
+        if room.is_full() || self.room_request_pending {
+            return;
+        }
+        if self.send_command(NetworkCommand::JoinPublicRoom(room.room_id.clone())) {
+            self.room_request_pending = true;
+            self.set_notice(
+                NoticeTone::Info,
+                format!("공개방 ‘{}’에 입장하는 중입니다", room.title),
+                "서버의 응답을 기다리고 있습니다.",
+            );
+        }
+    }
+
+    fn refresh_public_rooms_if_due(&mut self) {
+        if !self.server_connected
+            || self.current_room.is_some()
+            || self.public_list_pending
+            || self
+                .last_public_refresh
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(4))
+        {
+            return;
+        }
+        if self.send_command(NetworkCommand::RefreshPublicRooms) {
+            self.public_list_pending = true;
+            self.last_public_refresh = Some(Instant::now());
         }
     }
 
@@ -486,9 +620,13 @@ impl ChatApp {
                 ui.add_space(3.0);
                 ui.label(
                     RichText::new(if self.current_room.is_some() {
-                        "종단간 암호화된 메시지를 상대방과 직접 주고받습니다."
+                        if self.current_room_public {
+                            "공개방 메시지는 암호화되어 직접 전송됩니다. 안전번호를 상대방과 비교하세요."
+                        } else {
+                            "종단간 암호화된 메시지를 상대방과 직접 주고받습니다."
+                        }
                     } else {
-                        "새 대화를 만들거나 받은 보안 초대 코드로 입장하세요."
+                        "공개방을 둘러보거나 비공개 초대 코드로 대화를 시작하세요."
                     })
                     .size(11.0)
                     .color(MUTED),
@@ -538,8 +676,17 @@ impl ChatApp {
                     status_pill(ui, "상대방 대기 중", WARNING);
                 }
 
-                if let Some(fingerprint) = room_fingerprint {
-                    status_pill(ui, &format!("대화 {fingerprint}"), PRIMARY_HOVER);
+                if let Some(number) = &self.safety_number {
+                    status_pill(ui, &format!("안전번호 {number}"), PRIMARY_HOVER);
+                }
+
+                if let Some(room_name) = room_fingerprint {
+                    let label = if self.current_room_public {
+                        format!("공개 · {room_name}")
+                    } else {
+                        format!("대화 {room_name}")
+                    };
+                    status_pill(ui, &label, PRIMARY_HOVER);
                 }
             });
         });
@@ -589,87 +736,271 @@ impl ChatApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.set_max_width(680.0);
+                    ui.set_max_width(760.0);
                     egui::Frame::new()
                         .fill(SURFACE)
                         .stroke(Stroke::new(1.0, BORDER))
                         .corner_radius(CornerRadius::same(7))
                         .inner_margin(Margin::same(20))
                         .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let enabled = self.server_connected && !self.room_request_pending;
+                            ui.set_width(ui.available_width());
+                            let enabled = self.server_connected && !self.room_request_pending;
 
-                        ui.label(RichText::new("새 방 만들기").size(15.0).strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("방이 열려 있는 동안 다시 사용할 수 있는 보안 초대 코드를 만듭니다.")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                        ui.add_space(10.0);
+                            ui.label(RichText::new("새 방 만들기").size(16.0).strong());
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut self.room_visibility,
+                                    RoomVisibility::Public,
+                                    "공개방",
+                                );
+                                ui.selectable_value(
+                                    &mut self.room_visibility,
+                                    RoomVisibility::Private,
+                                    "비공개방",
+                                );
+                            });
+                            ui.add_space(10.0);
 
-                        let create_response = ui.add_enabled(
-                            enabled,
-                            egui::Button::new(
-                                RichText::new(if self.room_request_pending {
-                                    "처리 중..."
-                                } else {
-                                    "새 방 만들기"
-                                })
-                                .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(PRIMARY)
-                            .stroke(Stroke::NONE)
-                            .corner_radius(CornerRadius::same(6))
-                            .min_size(egui::vec2(150.0, 42.0)),
-                        );
-                        paint_focus_ring(ui, &create_response, 6);
-
-                        if create_response.clicked() {
-                            self.create_room();
-                        }
-
-                        ui.add_space(20.0);
-                        ui.separator();
-                        ui.add_space(16.0);
-                        ui.label(RichText::new("초대 코드로 입장").size(15.0).strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("상대방에게 받은 전체 코드를 붙여넣으세요. Enter로 바로 입장할 수 있습니다.")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                        ui.add_space(10.0);
-
-                        ui.horizontal(|ui| {
-                            let join_button_width = 88.0;
-                            let input_width =
-                                (ui.available_width() - join_button_width - 8.0).max(120.0);
-                            let response = ui.add_enabled(
-                                enabled,
-                                egui::TextEdit::singleline(&mut self.room_code)
-                                    .hint_text("P2P2-로 시작하는 보안 초대 코드")
-                                    .char_limit(128)
-                                    .desired_width(input_width)
-                                    .font(egui::TextStyle::Monospace)
-                                    .text_color(TEXT)
-                                    .background_color(SURFACE_RAISED)
-                                    .margin(Margin::symmetric(12, 10))
-                                    .vertical_align(Align::Center),
-                            );
-
-                            if self.focus_room_code && enabled {
-                                response.request_focus();
-                                self.focus_room_code = false;
+                            match self.room_visibility {
+                                RoomVisibility::Public => {
+                                    ui.label(
+                                        RichText::new("목록에 표시할 방 이름을 입력하세요.")
+                                            .size(11.0)
+                                            .color(MUTED),
+                                    );
+                                    ui.add_space(6.0);
+                                    let title_response = ui.add_enabled(
+                                        enabled,
+                                        egui::TextEdit::singleline(&mut self.public_room_title)
+                                            .hint_text("예: Rust 이야기")
+                                            .char_limit(MAX_PUBLIC_ROOM_TITLE_CHARS)
+                                            .desired_width(f32::INFINITY)
+                                            .text_color(TEXT)
+                                            .background_color(SURFACE_RAISED)
+                                            .margin(Margin::symmetric(12, 10)),
+                                    );
+                                    paint_focus_ring(ui, &title_response, 6);
+                                    let enter_pressed = title_response.lost_focus()
+                                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                    let valid_title = normalize_public_room_title(
+                                        &self.public_room_title,
+                                    )
+                                    .is_some();
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new("공개방은 누구나 코드 없이 입장할 수 있습니다. 연결 후 안전번호를 비교하면 중간자 공격 여부를 확인할 수 있습니다.")
+                                            .size(11.0)
+                                            .color(WARNING),
+                                    );
+                                    ui.add_space(10.0);
+                                    let create_response = ui.add_enabled(
+                                        enabled && valid_title,
+                                        egui::Button::new(
+                                            RichText::new(if self.room_request_pending {
+                                                "처리 중..."
+                                            } else {
+                                                "공개방 만들기"
+                                            })
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                        )
+                                        .fill(PRIMARY)
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(CornerRadius::same(6))
+                                        .min_size(egui::vec2(150.0, 42.0)),
+                                    );
+                                    paint_focus_ring(ui, &create_response, 6);
+                                    if create_response.clicked()
+                                        || (enter_pressed && enabled && valid_title)
+                                    {
+                                        self.create_room();
+                                    }
+                                }
+                                RoomVisibility::Private => {
+                                    ui.label(
+                                        RichText::new("목록에 노출되지 않는 방과 인증된 보안 초대 코드를 만듭니다.")
+                                            .size(11.0)
+                                            .color(MUTED),
+                                    );
+                                    ui.add_space(10.0);
+                                    let create_response = ui.add_enabled(
+                                        enabled,
+                                        egui::Button::new(
+                                            RichText::new(if self.room_request_pending {
+                                                "처리 중..."
+                                            } else {
+                                                "비공개방 만들기"
+                                            })
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                        )
+                                        .fill(PRIMARY)
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(CornerRadius::same(6))
+                                        .min_size(egui::vec2(160.0, 42.0)),
+                                    );
+                                    paint_focus_ring(ui, &create_response, 6);
+                                    if create_response.clicked() {
+                                        self.create_room();
+                                    }
+                                }
                             }
-                            paint_focus_ring(ui, &response, 6);
+                        });
 
-                            let enter_pressed = response.lost_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                            let can_join = enabled && self.room_code.trim().parse::<InviteCode>().is_ok();
-                            let join_response = ui
-                                .add_enabled(
+                    ui.add_space(14.0);
+                    egui::Frame::new()
+                        .fill(SURFACE)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(7))
+                        .inner_margin(Margin::same(20))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("공개방 목록").size(16.0).strong());
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let refresh = ui.add_enabled(
+                                        self.server_connected && !self.public_list_pending,
+                                        egui::Button::new(if self.public_list_pending {
+                                            "불러오는 중..."
+                                        } else {
+                                            "새로고침"
+                                        })
+                                        .frame(false),
+                                    );
+                                    if refresh.clicked() {
+                                        self.last_public_refresh = None;
+                                    }
+                                });
+                            });
+                            ui.label(
+                                RichText::new("입장 가능한 방을 먼저 보여줍니다. 만석인 방은 아래에서 비활성화됩니다.")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                            ui.add_space(10.0);
+
+                            if self.public_rooms.is_empty() {
+                                egui::Frame::new()
+                                    .fill(SURFACE_RAISED)
+                                    .corner_radius(CornerRadius::same(6))
+                                    .inner_margin(Margin::same(14))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(if self.public_list_pending {
+                                                "공개방을 불러오는 중입니다."
+                                            } else {
+                                                "아직 공개방이 없습니다. 첫 방을 만들어 보세요."
+                                            })
+                                            .color(MUTED),
+                                        );
+                                    });
+                            } else {
+                                let rooms = self.public_rooms.clone();
+                                for room in rooms {
+                                    let full = room.is_full();
+                                    egui::Frame::new()
+                                        .fill(if full {
+                                            SURFACE_RAISED.gamma_multiply(0.55)
+                                        } else {
+                                            SURFACE_RAISED
+                                        })
+                                        .stroke(Stroke::new(1.0, BORDER))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(Margin::symmetric(14, 10))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        RichText::new(&room.title)
+                                                            .strong()
+                                                            .color(if full { MUTED } else { TEXT }),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{} / 2명 · {}",
+                                                            room.occupants,
+                                                            if full { "대화 중" } else { "입장 가능" }
+                                                        ))
+                                                        .size(11.0)
+                                                        .color(if full { MUTED } else { SUCCESS }),
+                                                    );
+                                                });
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        let join = ui.add_enabled(
+                                                            !full
+                                                                && self.server_connected
+                                                                && !self.room_request_pending,
+                                                            egui::Button::new(if full {
+                                                                "만석"
+                                                            } else {
+                                                                "입장"
+                                                            })
+                                                            .fill(if full {
+                                                                Color32::TRANSPARENT
+                                                            } else {
+                                                                PRIMARY
+                                                            })
+                                                            .corner_radius(CornerRadius::same(6))
+                                                            .min_size(egui::vec2(76.0, 36.0)),
+                                                        );
+                                                        paint_focus_ring(ui, &join, 6);
+                                                        if join.clicked() {
+                                                            self.join_public_room(&room);
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                        });
+                                    ui.add_space(6.0);
+                                }
+                            }
+                        });
+
+                    ui.add_space(14.0);
+                    egui::Frame::new()
+                        .fill(SURFACE)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(7))
+                        .inner_margin(Margin::same(20))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let enabled = self.server_connected && !self.room_request_pending;
+                            ui.label(RichText::new("비공개 초대 코드로 입장").size(15.0).strong());
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("상대방에게 받은 전체 코드를 붙여넣으세요. Enter로 바로 입장할 수 있습니다.")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                let join_button_width = 88.0;
+                                let input_width =
+                                    (ui.available_width() - join_button_width - 8.0).max(120.0);
+                                let response = ui.add_enabled(
+                                    enabled,
+                                    egui::TextEdit::singleline(&mut self.room_code)
+                                        .hint_text("P2P2-로 시작하는 보안 초대 코드")
+                                        .char_limit(128)
+                                        .desired_width(input_width)
+                                        .font(egui::TextStyle::Monospace)
+                                        .text_color(TEXT)
+                                        .background_color(SURFACE_RAISED)
+                                        .margin(Margin::symmetric(12, 10)),
+                                );
+                                if self.focus_room_code && enabled {
+                                    response.request_focus();
+                                    self.focus_room_code = false;
+                                }
+                                paint_focus_ring(ui, &response, 6);
+                                let enter_pressed = response.lost_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                let can_join = enabled
+                                    && self.room_code.trim().parse::<InviteCode>().is_ok();
+                                let join_response = ui.add_enabled(
                                     can_join,
                                     egui::Button::new(RichText::new("입장").strong())
                                         .fill(SURFACE_RAISED)
@@ -677,23 +1008,20 @@ impl ChatApp {
                                         .corner_radius(CornerRadius::same(6))
                                         .min_size(egui::vec2(join_button_width, 42.0)),
                                 );
-                            paint_focus_ring(ui, &join_response, 6);
-                            let join_clicked = join_response.clicked();
-
-                            if (enter_pressed && can_join) || join_clicked {
-                                self.join_room();
-                            } else if enter_pressed {
-                                self.focus_room_code = true;
-                            }
+                                paint_focus_ring(ui, &join_response, 6);
+                                if (enter_pressed && can_join) || join_response.clicked() {
+                                    self.join_room();
+                                } else if enter_pressed {
+                                    self.focus_room_code = true;
+                                }
+                            });
+                            ui.add_space(14.0);
+                            ui.label(
+                                RichText::new("개인정보 안내: 직접 연결 방식이므로 대화 상대는 회원님의 공개 IP 주소를 확인할 수 있습니다. 메시지 내용은 서버에 저장되지 않습니다.")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
                         });
-
-                        ui.add_space(16.0);
-                        ui.label(
-                            RichText::new("개인정보 안내: 직접 연결 방식이므로 대화 상대는 회원님의 공개 IP 주소를 확인할 수 있습니다. 메시지 내용과 초대 비밀은 서버에 저장되지 않습니다.")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                    });
                 });
             });
     }
@@ -752,7 +1080,11 @@ impl ChatApp {
                                 } else {
                                     (
                                         "상대방을 기다리고 있습니다",
-                                        "위의 보안 초대 코드를 공유해 주세요.",
+                                        if self.current_room_public {
+                                            "공개방 목록에서 새 상대방이 입장할 때까지 기다려 주세요."
+                                        } else {
+                                            "위의 보안 초대 코드를 공유해 주세요."
+                                        },
                                     )
                                 };
 
@@ -852,9 +1184,11 @@ impl ChatApp {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new(
-                        "나가면 현재 기기에서는 이 대화와 초대 코드를 다시 사용할 수 없습니다.",
-                    )
+                    RichText::new(if self.current_room_public {
+                        "나가면 이 공개방에서 연결이 끊기며, 혼자 남은 상대방은 새 참가자를 기다립니다."
+                    } else {
+                        "나가면 현재 기기에서는 이 대화와 초대 코드를 다시 사용할 수 없습니다."
+                    })
                     .size(12.0)
                     .color(MUTED),
                 );
@@ -1034,6 +1368,7 @@ fn setup_style(ctx: &egui::Context) {
 impl eframe::App for ChatApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_network_events();
+        self.refresh_public_rooms_if_due();
         ui.ctx().request_repaint_after(Duration::from_millis(100));
         ui.set_min_size(ui.available_size());
 

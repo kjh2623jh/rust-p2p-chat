@@ -3,10 +3,26 @@ pub mod client;
 
 use crate::protocol::InviteCode;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicRoomSummary {
+    pub room_id: String,
+    pub title: String,
+    pub occupants: u8,
+}
+
+impl PublicRoomSummary {
+    pub fn is_full(&self) -> bool {
+        self.occupants >= 2
+    }
+}
+
 #[derive(Debug)]
 pub enum NetworkCommand {
     CreateRoom,
+    CreatePublicRoom(String),
     JoinRoom(InviteCode),
+    JoinPublicRoom(String),
+    RefreshPublicRooms,
     LeaveRoom,
     SendMessage(String),
 }
@@ -18,12 +34,17 @@ pub enum NetworkEvent {
 
     RoomCreated { invite: String, fingerprint: String },
     JoinedRoom { invite: String, fingerprint: String },
+    PublicRoomCreated { room_id: String, title: String },
+    PublicRoomJoined { room_id: String, title: String },
+    PublicRooms(Vec<PublicRoomSummary>),
 
     RoomFull,
     RoomNotFound,
+    PublicRoomFull,
+    PublicRoomNotFound,
     AlreadyInRoom,
 
-    PeerConnected,
+    PeerConnected { safety_number: Option<String> },
     PeerDisconnected,
     RoomExpired,
 
@@ -44,6 +65,7 @@ pub enum NetworkError {
     ProtocolMismatch,
     PeerAuthenticationFailed,
     RateLimited,
+    PublicRoomLimit,
     MessageTooLong,
     Transport(String),
 }
@@ -63,6 +85,10 @@ impl std::fmt::Display for NetworkError {
             Self::RateLimited => write!(
                 formatter,
                 "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요."
+            ),
+            Self::PublicRoomLimit => write!(
+                formatter,
+                "공개방이 너무 많아 지금은 새 공개방을 만들 수 없습니다. 잠시 후 다시 시도해 주세요."
             ),
             Self::MessageTooLong => {
                 write!(formatter, "메시지는 500자, 1024바이트 이하여야 합니다.")

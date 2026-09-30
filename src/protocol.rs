@@ -4,11 +4,13 @@ use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
 use zeroize::Zeroize;
 
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 pub const MAX_SIGNAL_LINE: usize = 512;
 pub const MAX_DATAGRAM: usize = 1200;
 pub const MAX_MESSAGE_CHARS: usize = 500;
 pub const MAX_MESSAGE_BYTES: usize = 1024;
+pub const MAX_PUBLIC_ROOM_TITLE_CHARS: usize = 40;
+pub const MAX_PUBLIC_ROOM_TITLE_BYTES: usize = 120;
 pub const INVITE_PREFIX: &str = "P2P2-";
 const ROOM_CONTEXT: &[u8] = b"p2p-chat/room/v2";
 const FINGERPRINT_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -110,6 +112,43 @@ pub fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     Some(result)
 }
 
+pub fn normalize_public_room_title(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > MAX_PUBLIC_ROOM_TITLE_CHARS
+        || value.len() > MAX_PUBLIC_ROOM_TITLE_BYTES
+        || value.chars().any(is_unsafe_title_character)
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+pub fn encode_public_room_title(value: &str) -> Option<String> {
+    normalize_public_room_title(value).map(|title| URL_SAFE_NO_PAD.encode(title.as_bytes()))
+}
+
+pub fn decode_public_room_title(value: &str) -> Option<String> {
+    let decoded = URL_SAFE_NO_PAD.decode(value).ok()?;
+    if URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return None;
+    }
+    let title = String::from_utf8(decoded).ok()?;
+    normalize_public_room_title(&title).filter(|normalized| normalized == &title)
+}
+
+fn is_unsafe_title_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
 fn hex_nibble(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
@@ -150,5 +189,15 @@ mod tests {
         let source = [0, 1, 15, 16, 254, 255];
         assert_eq!(decode_hex::<6>(&encode_hex(&source)), Some(source));
         assert_eq!(decode_hex::<6>("zzzzzzzzzzzz"), None);
+    }
+
+    #[test]
+    fn public_room_title_round_trip_and_validation() {
+        let title = "Rust 초보자 대화";
+        let encoded = encode_public_room_title(title).unwrap();
+        assert_eq!(decode_public_room_title(&encoded).as_deref(), Some(title));
+        assert!(normalize_public_room_title("  ").is_none());
+        assert!(normalize_public_room_title("앞\u{202e}뒤").is_none());
+        assert!(normalize_public_room_title(&"a".repeat(41)).is_none());
     }
 }

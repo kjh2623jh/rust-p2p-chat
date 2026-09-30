@@ -1,11 +1,12 @@
-use super::{NetworkCommand, NetworkError, NetworkEvent};
+use super::{NetworkCommand, NetworkError, NetworkEvent, PublicRoomSummary};
 use crate::protocol::{
     InviteCode, MAX_DATAGRAM, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS, MAX_SIGNAL_LINE,
-    PROTOCOL_VERSION, decode_hex, encode_hex,
+    PROTOCOL_VERSION, decode_hex, decode_public_room_title, encode_hex, encode_public_room_title,
+    normalize_public_room_title,
 };
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use snow::{Builder, HandshakeState, StatelessTransportState, params::NoiseParams};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -34,7 +35,8 @@ type HmacSha256 = Hmac<Sha256>;
 const DEFAULT_SERVER_HOST: &str = "p2psignal.mcv.kr";
 const DEFAULT_TCP_PORT: u16 = 9000;
 const DEFAULT_UDP_PORT: u16 = 9001;
-const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
+const PRIVATE_NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
+const PUBLIC_NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_SHA256";
 const MAGIC: &[u8; 4] = b"P2P2";
 const PACKET_PUNCH: u8 = 0;
 const PACKET_HANDSHAKE_INIT: u8 = 1;
@@ -165,9 +167,28 @@ impl Drop for AbortOnDrop {
 }
 
 struct RoomContext {
-    invite: InviteCode,
+    security: RoomSecurity,
     room_id: [u8; 16],
     session_nonce: [u8; 16],
+}
+
+enum RoomSecurity {
+    Private(InviteCode),
+    Public,
+}
+
+enum PendingRoom {
+    Private(InviteCode),
+    Public {
+        room_id: [u8; 16],
+        expected_title: Option<String>,
+    },
+}
+
+impl PendingRoom {
+    fn is_public(&self) -> bool {
+        matches!(self, Self::Public { .. })
+    }
 }
 
 struct RegistrationAttempt {
@@ -257,20 +278,37 @@ struct SecurePeer {
     received_order: VecDeque<u64>,
     rate_started: Instant,
     packets_this_second: u32,
+    public_room: bool,
+    safety_number: Option<String>,
 }
 
 impl SecurePeer {
     fn new(address: SocketAddr, initiator: bool, room: &RoomContext) -> Result<Self, NetworkError> {
-        let params: NoiseParams = NOISE_PATTERN
+        let public_room = matches!(room.security, RoomSecurity::Public);
+        let pattern = if public_room {
+            PUBLIC_NOISE_PATTERN
+        } else {
+            PRIVATE_NOISE_PATTERN
+        };
+        let params: NoiseParams = pattern
             .parse()
             .map_err(|_| NetworkError::ProtocolMismatch)?;
-        let mut prologue = b"p2p-chat/v2/noise".to_vec();
+        let mut prologue = if public_room {
+            b"p2p-chat/v2/public-noise".to_vec()
+        } else {
+            b"p2p-chat/v2/noise".to_vec()
+        };
         prologue.extend_from_slice(&room.room_id);
         prologue.extend_from_slice(&room.session_nonce);
         let builder = Builder::new(params)
             .prologue(&prologue)
-            .and_then(|builder| builder.psk(0, room.invite.secret()))
             .map_err(|_| NetworkError::PeerAuthenticationFailed)?;
+        let builder = match &room.security {
+            RoomSecurity::Private(invite) => builder
+                .psk(0, invite.secret())
+                .map_err(|_| NetworkError::PeerAuthenticationFailed)?,
+            RoomSecurity::Public => builder,
+        };
         let mut handshake = if initiator {
             builder.build_initiator()
         } else {
@@ -312,6 +350,8 @@ impl SecurePeer {
             received_order: VecDeque::new(),
             rate_started: now,
             packets_this_second: 0,
+            public_room,
+            safety_number: None,
         })
     }
 
@@ -465,7 +505,8 @@ impl NetworkClient {
 
         let _ = self.event_tx.send(NetworkEvent::ServerConnected).await;
         let mut room: Option<RoomContext> = None;
-        let mut pending_invite: Option<InviteCode> = None;
+        let mut pending_room: Option<PendingRoom> = None;
+        let mut pending_public_rooms: Option<Vec<PublicRoomSummary>> = None;
         let mut registration = RegistrationState::default();
         let mut peer: Option<SecurePeer> = None;
         let mut timer = interval(Duration::from_millis(100));
@@ -478,23 +519,53 @@ impl NetworkClient {
                     let Some(command) = command else { return Ok(RunOutcome::CommandChannelClosed) };
                     match command {
                         NetworkCommand::CreateRoom => {
-                            if room.is_none() && pending_invite.is_none() {
+                            if room.is_none() && pending_room.is_none() {
                                 let invite = InviteCode::generate();
                                 writer.write_all(format!("CREATE {}\n", invite.room_id_hex()).as_bytes()).await?;
-                                pending_invite = Some(invite);
+                                pending_room = Some(PendingRoom::Private(invite));
+                            }
+                        }
+                        NetworkCommand::CreatePublicRoom(title) => {
+                            if room.is_none() && pending_room.is_none()
+                                && let (Some(title), room_id) = (
+                                    normalize_public_room_title(&title),
+                                    random_bytes::<16>(),
+                                )
+                            {
+                                let encoded_title = encode_public_room_title(&title)
+                                    .expect("normalized public room title");
+                                writer.write_all(
+                                    format!("CREATE_PUBLIC {} {encoded_title}\n", encode_hex(&room_id)).as_bytes()
+                                ).await?;
+                                pending_room = Some(PendingRoom::Public {
+                                    room_id,
+                                    expected_title: Some(title),
+                                });
                             }
                         }
                         NetworkCommand::JoinRoom(invite) => {
-                            if room.is_none() && pending_invite.is_none() {
+                            if room.is_none() && pending_room.is_none() {
                                 writer.write_all(format!("JOIN {}\n", invite.room_id_hex()).as_bytes()).await?;
-                                pending_invite = Some(invite);
+                                pending_room = Some(PendingRoom::Private(invite));
                             }
                         }
+                        NetworkCommand::JoinPublicRoom(room_id) => {
+                            if room.is_none() && pending_room.is_none()
+                                && let Some(decoded) = decode_hex::<16>(&room_id)
+                            {
+                                writer.write_all(format!("JOIN_PUBLIC {room_id}\n").as_bytes()).await?;
+                                pending_room = Some(PendingRoom::Public {
+                                    room_id: decoded,
+                                    expected_title: None,
+                                });
+                            }
+                        }
+                        NetworkCommand::RefreshPublicRooms => writer.write_all(b"LIST_PUBLIC\n").await?,
                         NetworkCommand::LeaveRoom => {
                             writer.write_all(b"LEAVE\n").await?;
                             fail_pending(&mut peer, &self.event_tx, "대화방에서 나갔습니다.").await;
                             room = None;
-                            pending_invite = None;
+                            pending_room = None;
                             registration.clear();
                             peer = None;
                         }
@@ -531,7 +602,7 @@ impl NetworkClient {
                     let line = line?;
                     let action = handle_server_line(
                         &line, &client_id, &registration_secret, udp_servers, &udp,
-                        &mut writer, &mut room, &mut pending_invite,
+                        &mut writer, &mut room, &mut pending_room, &mut pending_public_rooms,
                         &mut registration, &mut peer, &self.event_tx,
                     ).await?;
                     if action == ServerAction::Disconnected {
@@ -722,7 +793,8 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
     udp: &UdpSockets,
     writer: &mut W,
     room: &mut Option<RoomContext>,
-    pending_invite: &mut Option<InviteCode>,
+    pending_room: &mut Option<PendingRoom>,
+    pending_public_rooms: &mut Option<Vec<PublicRoomSummary>>,
     registration: &mut RegistrationState,
     peer: &mut Option<SecurePeer>,
     event_tx: &mpsc::Sender<NetworkEvent>,
@@ -736,10 +808,10 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 send_protocol_error(event_tx).await;
                 return Ok(ServerAction::Continue);
             };
-            let (Some(room_id), Some(session_nonce), Some(invite)) = (
+            let (Some(room_id), Some(session_nonce), Some(PendingRoom::Private(invite))) = (
                 decode_hex::<16>(room_id),
                 decode_hex::<16>(session_nonce),
-                pending_invite.take(),
+                pending_room.take(),
             ) else {
                 send_protocol_error(event_tx).await;
                 return Ok(ServerAction::Continue);
@@ -751,7 +823,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
             let fingerprint = invite.fingerprint();
             let exposed = invite.expose();
             *room = Some(RoomContext {
-                invite,
+                security: RoomSecurity::Private(invite),
                 room_id,
                 session_nonce,
             });
@@ -850,6 +922,98 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 }
             }
         }
+        Some("PUBLIC_CREATED") | Some("PUBLIC_JOINED") => {
+            let created = line.starts_with("PUBLIC_CREATED ");
+            let (Some(room_id), Some(session_nonce), Some(encoded_title), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                send_protocol_error(event_tx).await;
+                return Ok(ServerAction::Continue);
+            };
+            let (
+                Some(room_id),
+                Some(session_nonce),
+                Some(title),
+                Some(PendingRoom::Public {
+                    room_id: pending_id,
+                    expected_title,
+                }),
+            ) = (
+                decode_hex::<16>(room_id),
+                decode_hex::<16>(session_nonce),
+                decode_public_room_title(encoded_title),
+                pending_room.take(),
+            )
+            else {
+                send_protocol_error(event_tx).await;
+                return Ok(ServerAction::Continue);
+            };
+            if room_id != pending_id
+                || expected_title
+                    .as_ref()
+                    .is_some_and(|expected| expected != &title)
+            {
+                send_protocol_error(event_tx).await;
+                return Ok(ServerAction::Continue);
+            }
+            let room_id_hex = encode_hex(&room_id);
+            *room = Some(RoomContext {
+                security: RoomSecurity::Public,
+                room_id,
+                session_nonce,
+            });
+            *registration = begin_registration(udp, udp_servers, client_id).await?;
+            let event = if created {
+                NetworkEvent::PublicRoomCreated {
+                    room_id: room_id_hex,
+                    title,
+                }
+            } else {
+                NetworkEvent::PublicRoomJoined {
+                    room_id: room_id_hex,
+                    title,
+                }
+            };
+            let _ = event_tx.send(event).await;
+        }
+        Some("PUBLIC_LIST_BEGIN") if parts.next().is_none() => {
+            *pending_public_rooms = Some(Vec::new());
+        }
+        Some("PUBLIC_ROOM") => {
+            let (Some(room_id), Some(occupants), Some(encoded_title), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                *pending_public_rooms = None;
+                send_protocol_error(event_tx).await;
+                return Ok(ServerAction::Continue);
+            };
+            let (Some(title), Some(occupants), Some(rooms)) = (
+                decode_public_room_title(encoded_title),
+                occupants.parse::<u8>().ok().filter(|count| *count <= 2),
+                pending_public_rooms.as_mut(),
+            ) else {
+                *pending_public_rooms = None;
+                send_protocol_error(event_tx).await;
+                return Ok(ServerAction::Continue);
+            };
+            if decode_hex::<16>(room_id).is_none() || rooms.len() >= 100 {
+                *pending_public_rooms = None;
+                send_protocol_error(event_tx).await;
+                return Ok(ServerAction::Continue);
+            }
+            rooms.push(PublicRoomSummary {
+                room_id: room_id.to_owned(),
+                title,
+                occupants,
+            });
+        }
+        Some("PUBLIC_LIST_END") if parts.next().is_none() => {
+            if let Some(rooms) = pending_public_rooms.take() {
+                let _ = event_tx.send(NetworkEvent::PublicRooms(rooms)).await;
+            } else {
+                send_protocol_error(event_tx).await;
+            }
+        }
         Some("PEER_LEFT") => {
             fail_pending(peer, event_tx, "상대방과 연결이 종료되었습니다.").await;
             registration.clear();
@@ -883,21 +1047,39 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
             let _ = event_tx.send(NetworkEvent::RoomExpired).await;
         }
         Some("ROOM_FULL") => {
-            *pending_invite = None;
-            let _ = event_tx.send(NetworkEvent::RoomFull).await;
+            let public = pending_room.as_ref().is_some_and(PendingRoom::is_public);
+            *pending_room = None;
+            let event = if public {
+                NetworkEvent::PublicRoomFull
+            } else {
+                NetworkEvent::RoomFull
+            };
+            let _ = event_tx.send(event).await;
         }
         Some("ROOM_NOT_FOUND") => {
-            *pending_invite = None;
-            let _ = event_tx.send(NetworkEvent::RoomNotFound).await;
+            let public = pending_room.as_ref().is_some_and(PendingRoom::is_public);
+            *pending_room = None;
+            let event = if public {
+                NetworkEvent::PublicRoomNotFound
+            } else {
+                NetworkEvent::RoomNotFound
+            };
+            let _ = event_tx.send(event).await;
         }
         Some("ALREADY_IN_ROOM") => {
-            *pending_invite = None;
+            *pending_room = None;
             let _ = event_tx.send(NetworkEvent::AlreadyInRoom).await;
         }
         Some("RATE_LIMITED") => {
-            *pending_invite = None;
+            *pending_room = None;
             let _ = event_tx
                 .send(NetworkEvent::Error(NetworkError::RateLimited))
+                .await;
+        }
+        Some("PUBLIC_ROOM_LIMIT") => {
+            *pending_room = None;
+            let _ = event_tx
+                .send(NetworkEvent::Error(NetworkError::PublicRoomLimit))
                 .await;
         }
         Some("LEFT") => {}
@@ -905,7 +1087,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
             send_protocol_error(event_tx).await;
         }
         Some("ERROR") | Some("ROOM_EXISTS") => {
-            *pending_invite = None;
+            *pending_room = None;
             let _ = event_tx
                 .send(NetworkEvent::Error(NetworkError::Transport(
                     "서버가 요청을 처리하지 못했습니다.".to_owned(),
@@ -957,6 +1139,9 @@ async fn handle_peer_packet(
                 .await
                 .map_err(|error| NetworkError::Transport(safe_io_error(&error)))?;
             peer.response_packet = Some(response);
+            if peer.public_room {
+                peer.safety_number = Some(handshake_safety_number(&handshake));
+            }
             peer.transport = Some(
                 handshake
                     .into_stateless_transport_mode()
@@ -973,6 +1158,9 @@ async fn handle_peer_packet(
             handshake
                 .read_message(&packet[5..], &mut scratch)
                 .map_err(|_| NetworkError::PeerAuthenticationFailed)?;
+            if peer.public_room {
+                peer.safety_number = Some(handshake_safety_number(&handshake));
+            }
             peer.transport = Some(
                 handshake
                     .into_stateless_transport_mode()
@@ -1050,8 +1238,22 @@ async fn handle_plaintext(
 async fn maybe_mark_connected(peer: &mut SecurePeer, event_tx: &mpsc::Sender<NetworkEvent>) {
     if !peer.connected && peer.ready_received && peer.ready_acked {
         peer.connected = true;
-        let _ = event_tx.send(NetworkEvent::PeerConnected).await;
+        let _ = event_tx
+            .send(NetworkEvent::PeerConnected {
+                safety_number: peer.safety_number.clone(),
+            })
+            .await;
     }
+}
+
+fn handshake_safety_number(handshake: &HandshakeState) -> String {
+    let digest = Sha256::digest(handshake.get_handshake_hash());
+    format!(
+        "{:03}-{:03}-{:03}",
+        u16::from_be_bytes([digest[0], digest[1]]) % 1000,
+        u16::from_be_bytes([digest[2], digest[3]]) % 1000,
+        u16::from_be_bytes([digest[4], digest[5]]) % 1000,
+    )
 }
 
 async fn send_ready(peer: &mut SecurePeer, udp: &UdpSockets) -> Result<(), NetworkError> {
@@ -1368,7 +1570,7 @@ mod tests {
     fn noise_psk_authenticates_and_detects_tampering() {
         let invite = InviteCode::generate();
         let room = RoomContext {
-            invite: invite.clone(),
+            security: RoomSecurity::Private(invite.clone()),
             room_id: invite.room_id(),
             session_nonce: [9; 16],
         };
@@ -1400,12 +1602,12 @@ mod tests {
         let invite_a = InviteCode::generate();
         let invite_b = InviteCode::generate();
         let room_a = RoomContext {
-            invite: invite_a.clone(),
+            security: RoomSecurity::Private(invite_a.clone()),
             room_id: invite_a.room_id(),
             session_nonce: [4; 16],
         };
         let room_b = RoomContext {
-            invite: invite_b.clone(),
+            security: RoomSecurity::Private(invite_b.clone()),
             room_id: invite_a.room_id(),
             session_nonce: [4; 16],
         };
@@ -1421,5 +1623,33 @@ mod tests {
                 .read_message(&initiator.initial_packet.unwrap()[5..], &mut scratch)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn public_noise_has_matching_safety_number() {
+        let room = RoomContext {
+            security: RoomSecurity::Public,
+            room_id: [3; 16],
+            session_nonce: [7; 16],
+        };
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut initiator = SecurePeer::new(address, true, &room).unwrap();
+        let mut responder = SecurePeer::new(address, false, &room).unwrap();
+        let mut scratch = [0_u8; MAX_DATAGRAM];
+        let mut responder_hs = responder.handshake.take().unwrap();
+        responder_hs
+            .read_message(
+                &initiator.initial_packet.as_ref().unwrap()[5..],
+                &mut scratch,
+            )
+            .unwrap();
+        let mut response = [0_u8; MAX_DATAGRAM];
+        let size = responder_hs.write_message(&[], &mut response).unwrap();
+        let responder_number = handshake_safety_number(&responder_hs);
+        let mut initiator_hs = initiator.handshake.take().unwrap();
+        initiator_hs
+            .read_message(&response[..size], &mut scratch)
+            .unwrap();
+        assert_eq!(responder_number, handshake_safety_number(&initiator_hs));
     }
 }

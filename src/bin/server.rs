@@ -1,5 +1,8 @@
 use hmac::{Hmac, Mac};
-use p2p_chat::protocol::{MAX_DATAGRAM, MAX_SIGNAL_LINE, PROTOCOL_VERSION, decode_hex, encode_hex};
+use p2p_chat::protocol::{
+    MAX_DATAGRAM, MAX_SIGNAL_LINE, PROTOCOL_VERSION, decode_hex, decode_public_room_title,
+    encode_hex, encode_public_room_title,
+};
 use rand::RngCore;
 use sha2::Sha256;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -37,6 +40,7 @@ const REGISTRATION_TTL: Duration = Duration::from_secs(5);
 const PEER_MATCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_CONNECTIONS_PER_IP: usize = 20;
+const MAX_PUBLIC_ROOMS: usize = 100;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum IpFamily {
@@ -101,10 +105,22 @@ struct Peer {
 
 struct Room {
     creator: String,
+    kind: RoomKind,
     session_nonce: [u8; 16],
     created_at: Instant,
     peers: HashMap<String, Peer>,
     selected_family: Option<IpFamily>,
+}
+
+enum RoomKind {
+    Private,
+    Public { title: String, list_rank: u64 },
+}
+
+impl RoomKind {
+    fn is_public(&self) -> bool {
+        matches!(self, Self::Public { .. })
+    }
 }
 
 struct RegistrationChallenge {
@@ -145,6 +161,7 @@ struct ServerState {
     rooms: HashMap<String, Room>,
     clients: HashMap<String, ClientRecord>,
     rates: HashMap<(IpRateKey, RateClass), TokenBucket>,
+    next_public_rank: u64,
 }
 
 type SharedState = Arc<Mutex<ServerState>>;
@@ -195,7 +212,7 @@ async fn main() -> io::Result<()> {
         ));
     }
 
-    info!(tcp = ?tcp_binds, udp = ?udp_binds, "signaling server v2 started");
+    info!(version = PROTOCOL_VERSION, tcp = ?tcp_binds, udp = ?udp_binds, "signaling server started");
 
     match listeners.join_next().await {
         Some(Ok(result)) => result,
@@ -422,6 +439,32 @@ async fn handle_client(
                     }
                 }
             }
+            Some("CREATE_PUBLIC") => {
+                if current_room.is_some() {
+                    let _ = tx.send("ALREADY_IN_ROOM\n".to_owned()).await;
+                    continue;
+                }
+                if !rate_allow(&state, tcp_addr.ip(), RateClass::Room).await {
+                    let _ = tx.send("RATE_LIMITED\n".to_owned()).await;
+                    continue;
+                }
+                let (Some(room_id), Some(encoded_title)) = (parts.next(), parts.next()) else {
+                    let _ = tx.send("ERROR INVALID_COMMAND\n".to_owned()).await;
+                    continue;
+                };
+                let Some(title) = decode_public_room_title(encoded_title)
+                    .filter(|_| decode_hex::<16>(room_id).is_some() && parts.next().is_none())
+                else {
+                    let _ = tx.send("ERROR INVALID_PUBLIC_ROOM\n".to_owned()).await;
+                    continue;
+                };
+                match create_public_room(&state, room_id, title, &client_id, tx.clone()).await {
+                    Ok(()) => current_room = Some(room_id.to_owned()),
+                    Err(code) => {
+                        let _ = tx.send(format!("{code}\n")).await;
+                    }
+                }
+            }
             Some("JOIN") => {
                 if current_room.is_some() {
                     let _ = tx.send("ALREADY_IN_ROOM\n".to_owned()).await;
@@ -441,6 +484,36 @@ async fn handle_client(
                         let _ = tx.send(format!("{code}\n")).await;
                     }
                 }
+            }
+            Some("JOIN_PUBLIC") => {
+                if current_room.is_some() {
+                    let _ = tx.send("ALREADY_IN_ROOM\n".to_owned()).await;
+                    continue;
+                }
+                if !rate_allow(&state, tcp_addr.ip(), RateClass::Room).await {
+                    let _ = tx.send("RATE_LIMITED\n".to_owned()).await;
+                    continue;
+                }
+                let Some(room_id) = parts
+                    .next()
+                    .filter(|id| decode_hex::<16>(id).is_some() && parts.next().is_none())
+                else {
+                    let _ = tx.send("ERROR INVALID_ROOM_ID\n".to_owned()).await;
+                    continue;
+                };
+                match join_public_room(&state, room_id, &client_id, tx.clone()).await {
+                    Ok(()) => current_room = Some(room_id.to_owned()),
+                    Err(code) => {
+                        let _ = tx.send(format!("{code}\n")).await;
+                    }
+                }
+            }
+            Some("LIST_PUBLIC") => {
+                if parts.next().is_some() {
+                    let _ = tx.send("ERROR INVALID_COMMAND\n".to_owned()).await;
+                    continue;
+                }
+                send_public_rooms(&state, &tx).await;
             }
             Some("LEAVE") | Some("P2P_FAILED") => {
                 if let Some(room_id) = current_room.take() {
@@ -485,6 +558,7 @@ async fn create_room(
             room_id.to_owned(),
             Room {
                 creator: client_id.to_owned(),
+                kind: RoomKind::Private,
                 session_nonce: nonce,
                 created_at: Instant::now(),
                 peers,
@@ -499,15 +573,95 @@ async fn create_room(
     Ok(())
 }
 
+async fn create_public_room(
+    state: &SharedState,
+    room_id: &str,
+    title: String,
+    client_id: &str,
+    sender: ClientSender,
+) -> Result<(), &'static str> {
+    let nonce = random_bytes::<16>();
+    let rank = {
+        let mut state = state.lock().await;
+        if state.rooms.contains_key(room_id) {
+            return Err("ROOM_EXISTS");
+        }
+        if state
+            .rooms
+            .values()
+            .filter(|room| room.kind.is_public())
+            .count()
+            >= MAX_PUBLIC_ROOMS
+        {
+            return Err("PUBLIC_ROOM_LIMIT");
+        }
+        state.next_public_rank = state.next_public_rank.wrapping_add(1).max(1);
+        let rank = state.next_public_rank;
+        let peers = HashMap::from([(
+            client_id.to_owned(),
+            Peer {
+                sender: sender.clone(),
+                endpoints: PeerEndpoints::default(),
+            },
+        )]);
+        state.rooms.insert(
+            room_id.to_owned(),
+            Room {
+                creator: client_id.to_owned(),
+                kind: RoomKind::Public {
+                    title: title.clone(),
+                    list_rank: rank,
+                },
+                session_nonce: nonce,
+                created_at: Instant::now(),
+                peers,
+                selected_family: None,
+            },
+        );
+        rank
+    };
+    let encoded_title = encode_public_room_title(&title).expect("validated public room title");
+    let _ = sender
+        .send(format!(
+            "PUBLIC_CREATED {room_id} {} {encoded_title}\n",
+            encode_hex(&nonce)
+        ))
+        .await;
+    info!(room = %short_id(room_id), rank, "public room created");
+    Ok(())
+}
+
 async fn join_room(
     state: &SharedState,
     room_id: &str,
     client_id: &str,
     sender: ClientSender,
 ) -> Result<(), &'static str> {
-    let nonce = {
+    join_room_kind(state, room_id, client_id, sender, false).await
+}
+
+async fn join_public_room(
+    state: &SharedState,
+    room_id: &str,
+    client_id: &str,
+    sender: ClientSender,
+) -> Result<(), &'static str> {
+    join_room_kind(state, room_id, client_id, sender, true).await
+}
+
+async fn join_room_kind(
+    state: &SharedState,
+    room_id: &str,
+    client_id: &str,
+    sender: ClientSender,
+    public: bool,
+) -> Result<(), &'static str> {
+    let (nonce, public_title) = {
         let mut state = state.lock().await;
         let room = state.rooms.get_mut(room_id).ok_or("ROOM_NOT_FOUND")?;
+        if room.kind.is_public() != public {
+            return Err("ROOM_NOT_FOUND");
+        }
         if room.peers.len() >= 2 {
             return Err("ROOM_FULL");
         }
@@ -518,11 +672,19 @@ async fn join_room(
                 endpoints: PeerEndpoints::default(),
             },
         );
-        room.session_nonce
+        let title = match &room.kind {
+            RoomKind::Private => None,
+            RoomKind::Public { title, .. } => Some(title.clone()),
+        };
+        (room.session_nonce, title)
     };
-    let _ = sender
-        .send(format!("JOINED {room_id} {}\n", encode_hex(&nonce)))
-        .await;
+    let response = if let Some(title) = public_title {
+        let title = encode_public_room_title(&title).expect("validated public room title");
+        format!("PUBLIC_JOINED {room_id} {} {title}\n", encode_hex(&nonce))
+    } else {
+        format!("JOINED {room_id} {}\n", encode_hex(&nonce))
+    };
+    let _ = sender.send(response).await;
     schedule_peer_match_timeout(Arc::clone(state), room_id.to_owned(), nonce);
     info!(room = %short_id(room_id), "room joined");
     Ok(())
@@ -531,6 +693,15 @@ async fn join_room(
 async fn leave_room(state: &SharedState, room_id: &str, client_id: &str) {
     let senders = {
         let mut state = state.lock().await;
+        let reopen_public = state.rooms.get(room_id).is_some_and(|room| {
+            room.kind.is_public() && room.peers.len() == 2 && room.peers.contains_key(client_id)
+        });
+        let new_rank = if reopen_public {
+            state.next_public_rank = state.next_public_rank.wrapping_add(1).max(1);
+            Some(state.next_public_rank)
+        } else {
+            None
+        };
         let Some(room) = state.rooms.get_mut(room_id) else {
             return;
         };
@@ -542,6 +713,9 @@ async fn leave_room(state: &SharedState, room_id: &str, client_id: &str) {
                 room.creator = remaining_client_id;
             }
             room.created_at = Instant::now();
+        }
+        if let (Some(rank), RoomKind::Public { list_rank, .. }) = (new_rank, &mut room.kind) {
+            *list_rank = rank;
         }
         let senders = room
             .peers
@@ -557,6 +731,47 @@ async fn leave_room(state: &SharedState, room_id: &str, client_id: &str) {
         let _ = sender.send("PEER_LEFT\n".to_owned()).await;
     }
     info!(room = %short_id(room_id), "room left");
+}
+
+async fn send_public_rooms(state: &SharedState, sender: &ClientSender) {
+    let mut rooms = {
+        let state = state.lock().await;
+        state
+            .rooms
+            .iter()
+            .filter_map(|(room_id, room)| match &room.kind {
+                RoomKind::Private => None,
+                RoomKind::Public { title, list_rank } => Some((
+                    room_id.clone(),
+                    title.clone(),
+                    room.peers.len().min(2) as u8,
+                    *list_rank,
+                )),
+            })
+            .collect::<Vec<_>>()
+    };
+    rooms.sort_by(|left, right| {
+        let left_full = left.2 >= 2;
+        let right_full = right.2 >= 2;
+        left_full
+            .cmp(&right_full)
+            .then_with(|| right.3.cmp(&left.3))
+    });
+
+    if sender.send("PUBLIC_LIST_BEGIN\n".to_owned()).await.is_err() {
+        return;
+    }
+    for (room_id, title, occupants, _) in rooms {
+        let title = encode_public_room_title(&title).expect("validated public room title");
+        if sender
+            .send(format!("PUBLIC_ROOM {room_id} {occupants} {title}\n"))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = sender.send("PUBLIC_LIST_END\n".to_owned()).await;
 }
 
 fn schedule_peer_match_timeout(state: SharedState, room_id: String, session_nonce: [u8; 16]) {
@@ -1138,5 +1353,77 @@ mod tests {
             .await
             .expect("replacement peer should be able to join");
         assert_eq!(state.lock().await.rooms[room_id].peers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn public_rooms_keep_full_rooms_at_bottom_and_reopened_rooms_move_to_top() {
+        let state = Arc::new(Mutex::new(ServerState::default()));
+        let old_room = "11111111111111111111111111111111";
+        let new_room = "22222222222222222222222222222222";
+        let (old_tx, mut old_rx) = mpsc::channel(16);
+        let (new_tx, mut new_rx) = mpsc::channel(16);
+        let (joiner_tx, mut joiner_rx) = mpsc::channel(16);
+
+        create_public_room(&state, old_room, "오래된 방".to_owned(), "old", old_tx)
+            .await
+            .unwrap();
+        create_public_room(&state, new_room, "새 방".to_owned(), "new", new_tx)
+            .await
+            .unwrap();
+        join_public_room(&state, new_room, "joiner", joiner_tx)
+            .await
+            .unwrap();
+        let _ = old_rx.recv().await;
+        let _ = new_rx.recv().await;
+        let _ = joiner_rx.recv().await;
+
+        let first = collect_public_list(&state).await;
+        assert!(first[1].starts_with(&format!("PUBLIC_ROOM {old_room} 1 ")));
+        assert!(first[2].starts_with(&format!("PUBLIC_ROOM {new_room} 2 ")));
+
+        leave_room(&state, new_room, "joiner").await;
+        let reopened = collect_public_list(&state).await;
+        assert!(reopened[1].starts_with(&format!("PUBLIC_ROOM {new_room} 1 ")));
+        assert!(reopened[2].starts_with(&format!("PUBLIC_ROOM {old_room} 1 ")));
+    }
+
+    #[tokio::test]
+    async fn private_and_public_join_commands_do_not_cross_room_types() {
+        let state = Arc::new(Mutex::new(ServerState::default()));
+        let private_id = "33333333333333333333333333333333";
+        let public_id = "44444444444444444444444444444444";
+        let (private_tx, _private_rx) = mpsc::channel(4);
+        let (public_tx, _public_rx) = mpsc::channel(4);
+        let (join_tx, _join_rx) = mpsc::channel(4);
+        create_room(&state, private_id, "private", private_tx)
+            .await
+            .unwrap();
+        create_public_room(&state, public_id, "공개방".to_owned(), "public", public_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            join_public_room(&state, private_id, "joiner", join_tx.clone()).await,
+            Err("ROOM_NOT_FOUND")
+        );
+        assert_eq!(
+            join_room(&state, public_id, "joiner", join_tx).await,
+            Err("ROOM_NOT_FOUND")
+        );
+    }
+
+    async fn collect_public_list(state: &SharedState) -> Vec<String> {
+        let (sender, mut receiver) = mpsc::channel(128);
+        send_public_rooms(state, &sender).await;
+        drop(sender);
+        let mut lines = Vec::new();
+        while let Some(line) = receiver.recv().await {
+            let done = line == "PUBLIC_LIST_END\n";
+            lines.push(line);
+            if done {
+                break;
+            }
+        }
+        lines
     }
 }
