@@ -1811,4 +1811,112 @@ mod tests {
             PeerTickAction::Failed
         );
     }
+
+    #[tokio::test]
+    async fn peers_complete_encrypted_nickname_handshake_over_udp() {
+        let invite = InviteCode::generate();
+        let room_id = invite.room_id();
+        let first_room = RoomContext {
+            security: RoomSecurity::Private(invite.clone()),
+            room_id,
+            session_nonce: [5; 16],
+            local_nickname: "alice".to_owned(),
+        };
+        let second_room = RoomContext {
+            security: RoomSecurity::Private(invite),
+            room_id,
+            session_nonce: [5; 16],
+            local_nickname: "bob".to_owned(),
+        };
+        let first_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first_socket.local_addr().unwrap();
+        let second_address = second_socket.local_addr().unwrap();
+        let first_udp = UdpSockets {
+            ipv4: Some(first_socket),
+            ipv6: None,
+        };
+        let second_udp = UdpSockets {
+            ipv4: Some(second_socket),
+            ipv6: None,
+        };
+        let mut first = Some(SecurePeer::new(second_address, true, &first_room).unwrap());
+        let mut second = Some(SecurePeer::new(first_address, false, &second_room).unwrap());
+        let (first_events, mut first_event_rx) = mpsc::channel(8);
+        let (second_events, mut second_event_rx) = mpsc::channel(8);
+        let mut first_buffer = [0_u8; MAX_DATAGRAM];
+        let mut second_buffer = [0_u8; MAX_DATAGRAM];
+
+        for _ in 0..100 {
+            let _ = tick_peer(&mut first, &first_udp, &first_events)
+                .await
+                .unwrap();
+            let _ = tick_peer(&mut second, &second_udp, &second_events)
+                .await
+                .unwrap();
+
+            if let Ok(Ok((size, from))) = timeout(
+                Duration::from_millis(5),
+                first_udp
+                    .ipv4
+                    .as_ref()
+                    .unwrap()
+                    .recv_from(&mut first_buffer),
+            )
+            .await
+            {
+                handle_peer_packet(
+                    &first_buffer[..size],
+                    first.as_mut().unwrap(),
+                    &first_udp,
+                    &first_events,
+                )
+                .await
+                .unwrap();
+                assert_eq!(from, second_address);
+            }
+            if let Ok(Ok((size, from))) = timeout(
+                Duration::from_millis(5),
+                second_udp
+                    .ipv4
+                    .as_ref()
+                    .unwrap()
+                    .recv_from(&mut second_buffer),
+            )
+            .await
+            {
+                handle_peer_packet(
+                    &second_buffer[..size],
+                    second.as_mut().unwrap(),
+                    &second_udp,
+                    &second_events,
+                )
+                .await
+                .unwrap();
+                assert_eq!(from, first_address);
+            }
+            if first.as_ref().unwrap().connected && second.as_ref().unwrap().connected {
+                break;
+            }
+        }
+
+        assert!(first.as_ref().unwrap().connected);
+        assert!(second.as_ref().unwrap().connected);
+        assert_eq!(
+            first.as_ref().unwrap().peer_nickname.as_deref(),
+            Some("bob")
+        );
+        assert_eq!(
+            second.as_ref().unwrap().peer_nickname.as_deref(),
+            Some("alice")
+        );
+        assert!(matches!(
+            first_event_rx.try_recv(),
+            Ok(NetworkEvent::PeerConnected { nickname, .. }) if nickname == "bob"
+        ));
+        assert!(matches!(
+            second_event_rx.try_recv(),
+            Ok(NetworkEvent::PeerConnected { nickname, .. }) if nickname == "alice"
+        ));
+    }
 }
