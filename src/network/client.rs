@@ -9,7 +9,9 @@ use sha2::Sha256;
 use snow::{Builder, HandshakeState, StatelessTransportState, params::NoiseParams};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    env, io,
+    env,
+    future::pending,
+    io,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -45,6 +47,104 @@ const PLAIN_MESSAGE_ACK: u8 = 4;
 const PLAIN_HEARTBEAT: u8 = 5;
 const MAX_PENDING_MESSAGES: usize = 64;
 const MAX_HISTORY_DEDUP: usize = 512;
+const IPV4_FALLBACK_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    fn of(address: SocketAddr) -> Self {
+        if address.is_ipv4() {
+            Self::V4
+        } else {
+            Self::V6
+        }
+    }
+
+    fn from_protocol_token(value: &str) -> Option<Self> {
+        match value {
+            "4" => Some(Self::V4),
+            "6" => Some(Self::V6),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct UdpServerEndpoints {
+    ipv4: Option<SocketAddr>,
+    ipv6: Option<SocketAddr>,
+}
+
+impl UdpServerEndpoints {
+    fn get(self, family: IpFamily) -> Option<SocketAddr> {
+        match family {
+            IpFamily::V4 => self.ipv4,
+            IpFamily::V6 => self.ipv6,
+        }
+    }
+}
+
+struct UdpSockets {
+    ipv4: Option<UdpSocket>,
+    ipv6: Option<UdpSocket>,
+}
+
+impl UdpSockets {
+    async fn bind(servers: UdpServerEndpoints) -> io::Result<Self> {
+        let mut last_error = None;
+        let ipv4 = if servers.ipv4.is_some() {
+            match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(socket) => Some(socket),
+                Err(error) => {
+                    last_error = Some(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let ipv6 = if servers.ipv6.is_some() {
+            match UdpSocket::bind("[::]:0").await {
+                Ok(socket) => Some(socket),
+                Err(error) => {
+                    last_error = Some(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if ipv4.is_none() && ipv6.is_none() {
+            return Err(last_error.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::AddrNotAvailable, "UDP server has no address")
+            }));
+        }
+        Ok(Self { ipv4, ipv6 })
+    }
+
+    fn get(&self, family: IpFamily) -> Option<&UdpSocket> {
+        match family {
+            IpFamily::V4 => self.ipv4.as_ref(),
+            IpFamily::V6 => self.ipv6.as_ref(),
+        }
+    }
+
+    async fn send_to(&self, packet: &[u8], address: SocketAddr) -> io::Result<usize> {
+        self.get(IpFamily::of(address))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "no UDP socket for destination address family",
+                )
+            })?
+            .send_to(packet, address)
+            .await
+    }
+}
 
 pub struct NetworkClient {
     command_rx: mpsc::Receiver<NetworkCommand>,
@@ -73,7 +173,21 @@ struct RoomContext {
 struct RegistrationAttempt {
     nonce: [u8; 16],
     started_at: Instant,
-    last_probe: Instant,
+    next_probe: Instant,
+    server: SocketAddr,
+}
+
+#[derive(Default)]
+struct RegistrationState {
+    attempts: HashMap<IpFamily, RegistrationAttempt>,
+    registered: HashSet<IpFamily>,
+}
+
+impl RegistrationState {
+    fn clear(&mut self) {
+        self.attempts.clear();
+        self.registered.clear();
+    }
 }
 
 struct PendingMessage {
@@ -309,16 +423,8 @@ impl NetworkClient {
                 return Ok(RunOutcome::ServerDisconnected);
             }
         };
-        let udp_server = lookup_host(&udp_address)
-            .await?
-            .find(SocketAddr::is_ipv4)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "UDP server has no IPv4 address",
-                )
-            })?;
-        let udp = UdpSocket::bind("0.0.0.0:0").await?;
+        let udp_servers = resolve_udp_servers(&udp_address).await?;
+        let udp = UdpSockets::bind(udp_servers).await?;
         let (mut reader, mut writer) = tokio::io::split(stream);
 
         let hello = timeout(Duration::from_secs(5), read_bounded_line(&mut reader))
@@ -360,10 +466,11 @@ impl NetworkClient {
         let _ = self.event_tx.send(NetworkEvent::ServerConnected).await;
         let mut room: Option<RoomContext> = None;
         let mut pending_invite: Option<InviteCode> = None;
-        let mut registration: Option<RegistrationAttempt> = None;
+        let mut registration = RegistrationState::default();
         let mut peer: Option<SecurePeer> = None;
         let mut timer = interval(Duration::from_millis(100));
-        let mut udp_buffer = [0_u8; MAX_DATAGRAM + 1];
+        let mut udp_v4_buffer = [0_u8; MAX_DATAGRAM + 1];
+        let mut udp_v6_buffer = [0_u8; MAX_DATAGRAM + 1];
 
         loop {
             tokio::select! {
@@ -388,7 +495,7 @@ impl NetworkClient {
                             fail_pending(&mut peer, &self.event_tx, "대화방에서 나갔습니다.").await;
                             room = None;
                             pending_invite = None;
-                            registration = None;
+                            registration.clear();
                             peer = None;
                         }
                         NetworkCommand::SendMessage(text) => {
@@ -423,7 +530,7 @@ impl NetworkClient {
                     let Some(line) = line else { return Ok(RunOutcome::ServerDisconnected) };
                     let line = line?;
                     let action = handle_server_line(
-                        &line, &client_id, &registration_secret, udp_server, &udp,
+                        &line, &client_id, &registration_secret, udp_servers, &udp,
                         &mut writer, &mut room, &mut pending_invite,
                         &mut registration, &mut peer, &self.event_tx,
                     ).await?;
@@ -431,13 +538,29 @@ impl NetworkClient {
                         return Ok(RunOutcome::ServerDisconnected);
                     }
                 }
-                received = udp.recv_from(&mut udp_buffer) => {
+                received = recv_from_optional(udp.ipv4.as_ref(), &mut udp_v4_buffer) => {
                     let (size, from) = received?;
                     if size > MAX_DATAGRAM { continue; }
                     let Some(active_peer) = peer.as_mut() else { continue };
                     if from != active_peer.address || !active_peer.allow_packet() { continue; }
                     if let Err(error) = handle_peer_packet(
-                        &udp_buffer[..size], active_peer, &udp, &self.event_tx
+                        &udp_v4_buffer[..size], active_peer, &udp, &self.event_tx
+                    ).await {
+                        let _ = self.event_tx.send(NetworkEvent::Error(error)).await;
+                        writer.write_all(b"P2P_FAILED\n").await?;
+                        fail_pending(&mut peer, &self.event_tx, "보안 연결이 종료되었습니다.").await;
+                        peer = None;
+                        room = None;
+                        let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
+                    }
+                }
+                received = recv_from_optional(udp.ipv6.as_ref(), &mut udp_v6_buffer) => {
+                    let (size, from) = received?;
+                    if size > MAX_DATAGRAM { continue; }
+                    let Some(active_peer) = peer.as_mut() else { continue };
+                    if from != active_peer.address || !active_peer.allow_packet() { continue; }
+                    if let Err(error) = handle_peer_packet(
+                        &udp_v6_buffer[..size], active_peer, &udp, &self.event_tx
                     ).await {
                         let _ = self.event_tx.send(NetworkEvent::Error(error)).await;
                         writer.write_all(b"P2P_FAILED\n").await?;
@@ -448,22 +571,14 @@ impl NetworkClient {
                     }
                 }
                 _ = timer.tick() => {
-                    if let Some(attempt) = registration.as_mut() {
-                        let now = Instant::now();
-                        if now.duration_since(attempt.started_at) >= Duration::from_secs(10) {
-                            writer.write_all(b"P2P_FAILED\n").await?;
-                            registration = None;
-                            room = None;
-                            let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
-                            continue;
-                        }
-                        if now.duration_since(attempt.last_probe) >= Duration::from_secs(1) {
-                            udp.send_to(
-                                format!("PROBE {client_id} {}", encode_hex(&attempt.nonce)).as_bytes(),
-                                udp_server,
-                            ).await?;
-                            attempt.last_probe = now;
-                        }
+                    if tick_registration(&mut registration, &udp, &client_id).await
+                        && registration.registered.is_empty()
+                    {
+                        writer.write_all(b"P2P_FAILED\n").await?;
+                        registration.clear();
+                        room = None;
+                        let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
+                        continue;
                     }
                     if tick_peer(&mut peer, &udp, &self.event_tx).await? {
                         writer.write_all(b"P2P_FAILED\n").await?;
@@ -478,6 +593,120 @@ impl NetworkClient {
     }
 }
 
+async fn resolve_udp_servers(address: &str) -> io::Result<UdpServerEndpoints> {
+    let mut endpoints = UdpServerEndpoints::default();
+    for address in lookup_host(address).await? {
+        match IpFamily::of(address) {
+            IpFamily::V4 if endpoints.ipv4.is_none() => endpoints.ipv4 = Some(address),
+            IpFamily::V6 if endpoints.ipv6.is_none() => endpoints.ipv6 = Some(address),
+            _ => {}
+        }
+    }
+    if endpoints.ipv4.is_none() && endpoints.ipv6.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "UDP server has no usable address",
+        ));
+    }
+    Ok(endpoints)
+}
+
+async fn recv_from_optional(
+    socket: Option<&UdpSocket>,
+    buffer: &mut [u8],
+) -> io::Result<(usize, SocketAddr)> {
+    match socket {
+        Some(socket) => socket.recv_from(buffer).await,
+        None => pending().await,
+    }
+}
+
+async fn begin_registration(
+    udp: &UdpSockets,
+    servers: UdpServerEndpoints,
+    client_id: &str,
+) -> io::Result<RegistrationState> {
+    let now = Instant::now();
+    let prefer_ipv6 = servers.ipv6.is_some() && udp.ipv6.is_some();
+    let mut state = RegistrationState::default();
+
+    for family in [IpFamily::V6, IpFamily::V4] {
+        let (Some(server), Some(_)) = (servers.get(family), udp.get(family)) else {
+            continue;
+        };
+        let delay = if family == IpFamily::V4 && prefer_ipv6 {
+            IPV4_FALLBACK_DELAY
+        } else {
+            Duration::ZERO
+        };
+        let attempt = RegistrationAttempt {
+            nonce: random_bytes::<16>(),
+            started_at: now,
+            next_probe: now + delay,
+            server,
+        };
+        state.attempts.insert(family, attempt);
+    }
+
+    if state.attempts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no matching UDP socket and server address",
+        ));
+    }
+
+    if let Some(attempt) = state.attempts.get_mut(&IpFamily::V6) {
+        let _ = send_registration_probe(udp, client_id, IpFamily::V6, attempt).await;
+        attempt.next_probe = now + Duration::from_secs(1);
+    }
+    if !prefer_ipv6 && let Some(attempt) = state.attempts.get_mut(&IpFamily::V4) {
+        let _ = send_registration_probe(udp, client_id, IpFamily::V4, attempt).await;
+        attempt.next_probe = now + Duration::from_secs(1);
+    }
+
+    Ok(state)
+}
+
+async fn send_registration_probe(
+    udp: &UdpSockets,
+    client_id: &str,
+    family: IpFamily,
+    attempt: &RegistrationAttempt,
+) -> io::Result<()> {
+    udp.get(family)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "UDP socket unavailable"))?
+        .send_to(
+            format!("PROBE {client_id} {} DS", encode_hex(&attempt.nonce)).as_bytes(),
+            attempt.server,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn tick_registration(
+    state: &mut RegistrationState,
+    udp: &UdpSockets,
+    client_id: &str,
+) -> bool {
+    let had_attempts = !state.attempts.is_empty();
+    let now = Instant::now();
+    let mut expired = Vec::new();
+    for (family, attempt) in &mut state.attempts {
+        if now.duration_since(attempt.started_at) >= Duration::from_secs(10) {
+            expired.push(*family);
+            continue;
+        }
+        if now >= attempt.next_probe {
+            let _ = send_registration_probe(udp, client_id, *family, attempt).await;
+            attempt.next_probe = now + Duration::from_secs(1);
+        }
+    }
+    for family in expired {
+        state.attempts.remove(&family);
+    }
+    had_attempts && state.attempts.is_empty()
+}
+
 #[derive(PartialEq, Eq)]
 enum ServerAction {
     Continue,
@@ -489,12 +718,12 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
     line: &str,
     client_id: &str,
     registration_secret: &[u8; 32],
-    udp_server: SocketAddr,
-    udp: &UdpSocket,
+    udp_servers: UdpServerEndpoints,
+    udp: &UdpSockets,
     writer: &mut W,
     room: &mut Option<RoomContext>,
     pending_invite: &mut Option<InviteCode>,
-    registration: &mut Option<RegistrationAttempt>,
+    registration: &mut RegistrationState,
     peer: &mut Option<SecurePeer>,
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) -> io::Result<ServerAction> {
@@ -526,17 +755,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 room_id,
                 session_nonce,
             });
-            let nonce = random_bytes::<16>();
-            *registration = Some(RegistrationAttempt {
-                nonce,
-                started_at: Instant::now(),
-                last_probe: Instant::now(),
-            });
-            udp.send_to(
-                format!("PROBE {client_id} {}", encode_hex(&nonce)).as_bytes(),
-                udp_server,
-            )
-            .await?;
+            *registration = begin_registration(udp, udp_servers, client_id).await?;
             if created {
                 let _ = event_tx
                     .send(NetworkEvent::RoomCreated {
@@ -566,13 +785,20 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
             ) else {
                 return Ok(ServerAction::Continue);
             };
-            if registration.as_ref().map(|attempt| &attempt.nonce) != Some(&client_nonce) {
+            let family = registration
+                .attempts
+                .iter()
+                .find_map(|(family, attempt)| (attempt.nonce == client_nonce).then_some(*family));
+            let Some(family) = family else {
                 return Ok(ServerAction::Continue);
-            }
+            };
             let payload = registration_payload(client_id, &client_nonce, &server_nonce, observed);
             let mut mac = HmacSha256::new_from_slice(registration_secret).expect("HMAC key length");
             mac.update(payload.as_bytes());
             let tag = mac.finalize().into_bytes();
+            let Some(server) = udp_servers.get(family) else {
+                return Ok(ServerAction::Continue);
+            };
             udp.send_to(
                 format!(
                     "REGISTER {client_id} {} {} {}",
@@ -581,11 +807,20 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                     encode_hex(&tag)
                 )
                 .as_bytes(),
-                udp_server,
+                server,
             )
             .await?;
         }
-        Some("REGISTERED") => *registration = None,
+        Some("REGISTERED") => {
+            if let Some(family) = parts.next().and_then(IpFamily::from_protocol_token) {
+                registration.attempts.remove(&family);
+                registration.registered.insert(family);
+            } else if registration.attempts.len() == 1 {
+                let family = *registration.attempts.keys().next().expect("length checked");
+                registration.attempts.clear();
+                registration.registered.insert(family);
+            }
+        }
         Some("PEER") => {
             let (Some(address), Some(role), Some(nonce)) =
                 (parts.next(), parts.next(), parts.next())
@@ -607,7 +842,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
             }
             match SecurePeer::new(address, role == "I", room_context) {
                 Ok(new_peer) => {
-                    *registration = None;
+                    registration.attempts.clear();
                     *peer = Some(new_peer);
                 }
                 Err(error) => {
@@ -617,14 +852,32 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
         }
         Some("PEER_LEFT") => {
             fail_pending(peer, event_tx, "상대방과 연결이 종료되었습니다.").await;
-            *registration = None;
+            registration.clear();
             *peer = None;
             let _ = event_tx.send(NetworkEvent::PeerDisconnected).await;
+        }
+        Some("P2P_UNAVAILABLE") => {
+            writer.write_all(b"P2P_FAILED\n").await?;
+            fail_pending(
+                peer,
+                event_tx,
+                "상대방과 호환되는 네트워크 경로가 없습니다.",
+            )
+            .await;
+            registration.clear();
+            *peer = None;
+            *room = None;
+            let _ = event_tx
+                .send(NetworkEvent::Error(NetworkError::Transport(
+                    "상대방과 공통으로 사용할 수 있는 IPv4 또는 IPv6 경로가 없습니다.".to_owned(),
+                )))
+                .await;
+            let _ = event_tx.send(NetworkEvent::P2pFailed).await;
         }
         Some("ROOM_EXPIRED") => {
             writer.write_all(b"LEAVE\n").await?;
             fail_pending(peer, event_tx, "대화방의 대기 시간이 만료되었습니다.").await;
-            *registration = None;
+            registration.clear();
             *peer = None;
             *room = None;
             let _ = event_tx.send(NetworkEvent::RoomExpired).await;
@@ -668,7 +921,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
 async fn handle_peer_packet(
     packet: &[u8],
     peer: &mut SecurePeer,
-    udp: &UdpSocket,
+    udp: &UdpSockets,
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) -> Result<(), NetworkError> {
     if packet.len() < 5 || &packet[..4] != MAGIC {
@@ -741,7 +994,7 @@ async fn handle_peer_packet(
 async fn handle_plaintext(
     plaintext: &[u8],
     peer: &mut SecurePeer,
-    udp: &UdpSocket,
+    udp: &UdpSockets,
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) -> Result<(), NetworkError> {
     match plaintext.first().copied() {
@@ -801,7 +1054,7 @@ async fn maybe_mark_connected(peer: &mut SecurePeer, event_tx: &mpsc::Sender<Net
     }
 }
 
-async fn send_ready(peer: &mut SecurePeer, udp: &UdpSocket) -> Result<(), NetworkError> {
+async fn send_ready(peer: &mut SecurePeer, udp: &UdpSockets) -> Result<(), NetworkError> {
     let packet = peer.encrypt(&[PLAIN_READY])?;
     udp.send_to(&packet, peer.address)
         .await
@@ -812,7 +1065,7 @@ async fn send_ready(peer: &mut SecurePeer, udp: &UdpSocket) -> Result<(), Networ
 
 async fn tick_peer(
     peer: &mut Option<SecurePeer>,
-    udp: &UdpSocket,
+    udp: &UdpSockets,
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) -> io::Result<bool> {
     let Some(peer) = peer.as_mut() else {
@@ -933,7 +1186,7 @@ async fn connect_tls(host: &str, address: &str) -> io::Result<TlsStream<TcpStrea
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
-    let tcp = timeout(Duration::from_secs(10), TcpStream::connect(address))
+    let tcp = timeout(Duration::from_secs(10), connect_tcp_dual_stack(address))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))??;
     let server_name = ServerName::try_from(host.to_owned())
@@ -942,6 +1195,59 @@ async fn connect_tls(host: &str, address: &str) -> io::Result<TlsStream<TcpStrea
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))?
         .map_err(io::Error::other)
+}
+
+async fn connect_tcp_dual_stack(address: &str) -> io::Result<TcpStream> {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for address in lookup_host(address).await? {
+        match IpFamily::of(address) {
+            IpFamily::V4 => ipv4.push(address),
+            IpFamily::V6 => ipv6.push(address),
+        }
+    }
+
+    match (ipv6.is_empty(), ipv4.is_empty()) {
+        (true, true) => Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "signaling server has no usable address",
+        )),
+        (false, true) => connect_first(ipv6).await,
+        (true, false) => connect_first(ipv4).await,
+        (false, false) => {
+            let mut ipv6_attempt = Box::pin(connect_first(ipv6));
+            let mut ipv4_attempt = Box::pin(async move {
+                sleep(IPV4_FALLBACK_DELAY).await;
+                connect_first(ipv4).await
+            });
+            tokio::select! {
+                result = &mut ipv6_attempt => match result {
+                    Ok(stream) => Ok(stream),
+                    Err(ipv6_error) => ipv4_attempt.await.or(Err(ipv6_error)),
+                },
+                result = &mut ipv4_attempt => match result {
+                    Ok(stream) => Ok(stream),
+                    Err(ipv4_error) => ipv6_attempt.await.or(Err(ipv4_error)),
+                },
+            }
+        }
+    }
+}
+
+async fn connect_first(addresses: Vec<SocketAddr>) -> io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no signaling server address",
+        )
+    }))
 }
 
 fn server_addresses() -> (String, String, String) {

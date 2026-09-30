@@ -2537,6 +2537,7 @@ dependencies = [
  "rand",
  "sha2",
  "snow",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tracing",

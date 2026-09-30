@@ -2,10 +2,11 @@ use hmac::{Hmac, Mac};
 use p2p_chat::protocol::{MAX_DATAGRAM, MAX_SIGNAL_LINE, PROTOCOL_VERSION, decode_hex, encode_hex};
 use rand::RngCore;
 use sha2::Sha256;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashMap,
     env, io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -13,7 +14,8 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, Semaphore, mpsc},
-    time::{interval, timeout},
+    task::JoinSet,
+    time::{interval, sleep, timeout},
 };
 use tokio_rustls::{
     TlsAcceptor,
@@ -32,13 +34,69 @@ const UDP_BIND: &str = "0.0.0.0:9001";
 const TLS_TIMEOUT: Duration = Duration::from_secs(10);
 const ROOM_TTL: Duration = Duration::from_secs(10 * 60);
 const REGISTRATION_TTL: Duration = Duration::from_secs(5);
+const PEER_MATCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_CONNECTIONS_PER_IP: usize = 20;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    fn of(address: SocketAddr) -> Self {
+        if address.is_ipv4() {
+            Self::V4
+        } else {
+            Self::V6
+        }
+    }
+
+    fn protocol_token(self) -> &'static str {
+        match self {
+            Self::V4 => "4",
+            Self::V6 => "6",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum IpRateKey {
+    V4(Ipv4Addr),
+    V6Prefix64([u8; 8]),
+}
+
+#[derive(Clone, Default)]
+struct PeerEndpoints {
+    ipv4: Option<SocketAddr>,
+    ipv6: Option<SocketAddr>,
+}
+
+impl PeerEndpoints {
+    fn insert(&mut self, address: SocketAddr) {
+        match IpFamily::of(address) {
+            IpFamily::V4 => self.ipv4 = Some(address),
+            IpFamily::V6 => self.ipv6 = Some(address),
+        }
+    }
+
+    fn get(&self, family: IpFamily) -> Option<SocketAddr> {
+        match family {
+            IpFamily::V4 => self.ipv4,
+            IpFamily::V6 => self.ipv6,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ipv4.is_none() && self.ipv6.is_none()
+    }
+}
 
 #[derive(Clone)]
 struct Peer {
     sender: ClientSender,
-    udp_addr: Option<SocketAddr>,
+    endpoints: PeerEndpoints,
 }
 
 struct Room {
@@ -46,6 +104,7 @@ struct Room {
     session_nonce: [u8; 16],
     created_at: Instant,
     peers: HashMap<String, Peer>,
+    selected_family: Option<IpFamily>,
 }
 
 struct RegistrationChallenge {
@@ -58,7 +117,8 @@ struct RegistrationChallenge {
 struct ClientRecord {
     sender: ClientSender,
     registration_secret: [u8; 32],
-    challenge: Option<RegistrationChallenge>,
+    challenges: HashMap<IpFamily, RegistrationChallenge>,
+    supports_dual_stack: bool,
 }
 
 impl Drop for ClientRecord {
@@ -84,7 +144,7 @@ struct TokenBucket {
 struct ServerState {
     rooms: HashMap<String, Room>,
     clients: HashMap<String, ClientRecord>,
-    rates: HashMap<(IpAddr, RateClass), TokenBucket>,
+    rates: HashMap<(IpRateKey, RateClass), TokenBucket>,
 }
 
 type SharedState = Arc<Mutex<ServerState>>;
@@ -102,17 +162,57 @@ async fn main() -> io::Result<()> {
     let tls = TlsAcceptor::from(Arc::new(load_tls_config(&cert_path, &key_path)?));
     let tcp_bind = env::var("P2P_TCP_BIND").unwrap_or_else(|_| TCP_BIND.to_owned());
     let udp_bind = env::var("P2P_UDP_BIND").unwrap_or_else(|_| UDP_BIND.to_owned());
-    let tcp_listener = TcpListener::bind(&tcp_bind).await?;
-    let udp_socket = UdpSocket::bind(&udp_bind).await?;
+    let tcp_bind_v6 = optional_env("P2P_TCP_BIND_V6");
+    let udp_bind_v6 = optional_env("P2P_UDP_BIND_V6");
     let state = Arc::new(Mutex::new(ServerState::default()));
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let connection_counts = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
+    let connection_counts = Arc::new(Mutex::new(HashMap::<IpRateKey, usize>::new()));
 
-    info!(tcp = %tcp_bind, udp = %udp_bind, "signaling server v2 started");
+    let mut udp_binds = vec![udp_bind.clone()];
+    if let Some(address) = udp_bind_v6 {
+        udp_binds.push(address);
+    }
+    for address in &udp_binds {
+        let socket = bind_udp_listener(address)?;
+        tokio::spawn(handle_udp_registration(socket, Arc::clone(&state)));
+    }
 
-    tokio::spawn(handle_udp_registration(udp_socket, Arc::clone(&state)));
     tokio::spawn(cleanup_expired_rooms(Arc::clone(&state)));
 
+    let mut tcp_binds = vec![tcp_bind.clone()];
+    if let Some(address) = tcp_bind_v6 {
+        tcp_binds.push(address);
+    }
+    let mut listeners = JoinSet::new();
+    for address in &tcp_binds {
+        let listener = bind_tcp_listener(address)?;
+        listeners.spawn(accept_connections(
+            listener,
+            tls.clone(),
+            Arc::clone(&state),
+            Arc::clone(&connection_limit),
+            Arc::clone(&connection_counts),
+        ));
+    }
+
+    info!(tcp = ?tcp_binds, udp = ?udp_binds, "signaling server v2 started");
+
+    match listeners.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(io::Error::other(format!(
+            "TCP listener task failed: {error}"
+        ))),
+        None => Err(io::Error::other("no TCP listeners were started")),
+    }
+}
+
+async fn accept_connections(
+    tcp_listener: TcpListener,
+    tls: TlsAcceptor,
+    state: SharedState,
+    connection_limit: Arc<Semaphore>,
+    connection_counts: Arc<Mutex<HashMap<IpRateKey, usize>>>,
+) -> io::Result<()> {
     loop {
         let (stream, address) = tcp_listener.accept().await?;
         let Ok(permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
@@ -120,9 +220,10 @@ async fn main() -> io::Result<()> {
             continue;
         };
 
+        let rate_key = ip_rate_key(address.ip());
         {
             let mut counts = connection_counts.lock().await;
-            let count = counts.entry(address.ip()).or_default();
+            let count = counts.entry(rate_key).or_default();
             if *count >= MAX_CONNECTIONS_PER_IP {
                 warn!("per-IP connection limit reached");
                 continue;
@@ -147,10 +248,10 @@ async fn main() -> io::Result<()> {
             }
 
             let mut counts = counts.lock().await;
-            if let Some(count) = counts.get_mut(&address.ip()) {
+            if let Some(count) = counts.get_mut(&rate_key) {
                 *count -= 1;
                 if *count == 0 {
-                    counts.remove(&address.ip());
+                    counts.remove(&rate_key);
                 }
             }
         });
@@ -160,6 +261,56 @@ async fn main() -> io::Result<()> {
 fn required_env(name: &str) -> io::Result<String> {
     env::var(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is required")))
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn bind_tcp_listener(address: &str) -> io::Result<TcpListener> {
+    let address = address.parse::<SocketAddr>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TCP bind address '{address}': {error}"),
+        )
+    })?;
+    let socket = new_bound_socket(address, Type::STREAM, Protocol::TCP)?;
+    socket.listen(1024)?;
+    let listener: std::net::TcpListener = socket.into();
+    listener.set_nonblocking(true)?;
+    TcpListener::from_std(listener)
+}
+
+fn bind_udp_listener(address: &str) -> io::Result<UdpSocket> {
+    let address = address.parse::<SocketAddr>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid UDP bind address '{address}': {error}"),
+        )
+    })?;
+    let socket = new_bound_socket(address, Type::DGRAM, Protocol::UDP)?;
+    let socket: std::net::UdpSocket = socket.into();
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket)
+}
+
+fn new_bound_socket(
+    address: SocketAddr,
+    socket_type: Type,
+    protocol: Protocol,
+) -> io::Result<Socket> {
+    let domain = if address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, socket_type, Some(protocol))?;
+    socket.set_reuse_address(true)?;
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&address.into())?;
+    Ok(socket)
 }
 
 fn load_tls_config(cert_path: &str, key_path: &str) -> io::Result<ServerConfig> {
@@ -203,7 +354,8 @@ async fn handle_client(
             ClientRecord {
                 sender: tx.clone(),
                 registration_secret,
-                challenge: None,
+                challenges: HashMap::new(),
+                supports_dual_stack: false,
             },
         );
     }
@@ -326,7 +478,7 @@ async fn create_room(
             client_id.to_owned(),
             Peer {
                 sender: sender.clone(),
-                udp_addr: None,
+                endpoints: PeerEndpoints::default(),
             },
         );
         state.rooms.insert(
@@ -336,6 +488,7 @@ async fn create_room(
                 session_nonce: nonce,
                 created_at: Instant::now(),
                 peers,
+                selected_family: None,
             },
         );
     }
@@ -362,7 +515,7 @@ async fn join_room(
             client_id.to_owned(),
             Peer {
                 sender: sender.clone(),
-                udp_addr: None,
+                endpoints: PeerEndpoints::default(),
             },
         );
         room.session_nonce
@@ -370,6 +523,7 @@ async fn join_room(
     let _ = sender
         .send(format!("JOINED {room_id} {}\n", encode_hex(&nonce)))
         .await;
+    schedule_peer_match_timeout(Arc::clone(state), room_id.to_owned(), nonce);
     info!(room = %short_id(room_id), "room joined");
     Ok(())
 }
@@ -382,6 +536,7 @@ async fn leave_room(state: &SharedState, room_id: &str, client_id: &str) {
         };
         let departing_creator = room.creator == client_id;
         room.peers.remove(client_id);
+        room.selected_family = None;
         if let Some(remaining_client_id) = room.peers.keys().next().cloned() {
             if departing_creator {
                 room.creator = remaining_client_id;
@@ -402,6 +557,36 @@ async fn leave_room(state: &SharedState, room_id: &str, client_id: &str) {
         let _ = sender.send("PEER_LEFT\n".to_owned()).await;
     }
     info!(room = %short_id(room_id), "room left");
+}
+
+fn schedule_peer_match_timeout(state: SharedState, room_id: String, session_nonce: [u8; 16]) {
+    tokio::spawn(async move {
+        sleep(PEER_MATCH_TIMEOUT).await;
+        let senders = {
+            let state = state.lock().await;
+            let Some(room) = state.rooms.get(&room_id) else {
+                return;
+            };
+            if room.session_nonce != session_nonce
+                || room.peers.len() != 2
+                || room.selected_family.is_some()
+                || room.peers.values().any(|peer| peer.endpoints.is_empty())
+            {
+                return;
+            }
+            room.peers
+                .keys()
+                .filter_map(|client_id| state.clients.get(client_id))
+                .filter(|client| client.supports_dual_stack)
+                .map(|client| client.sender.clone())
+                .collect::<Vec<_>>()
+        };
+        for sender in senders {
+            let _ = sender
+                .send("P2P_UNAVAILABLE ADDRESS_FAMILY\n".to_owned())
+                .await;
+        }
+    });
 }
 
 async fn handle_udp_registration(socket: UdpSocket, state: SharedState) {
@@ -425,18 +610,23 @@ async fn handle_udp_registration(socket: UdpSocket, state: SharedState) {
                 let Some(client_nonce) = decode_hex::<16>(client_nonce) else {
                     continue;
                 };
+                let supports_dual_stack = parts.next() == Some("DS");
                 let server_nonce = random_bytes::<16>();
                 let sender = {
                     let mut state = state.lock().await;
                     let Some(client) = state.clients.get_mut(client_id) else {
                         continue;
                     };
-                    client.challenge = Some(RegistrationChallenge {
-                        source,
-                        client_nonce,
-                        server_nonce,
-                        expires_at: Instant::now() + REGISTRATION_TTL,
-                    });
+                    client.supports_dual_stack |= supports_dual_stack;
+                    client.challenges.insert(
+                        IpFamily::of(source),
+                        RegistrationChallenge {
+                            source,
+                            client_nonce,
+                            server_nonce,
+                            expires_at: Instant::now() + REGISTRATION_TTL,
+                        },
+                    );
                     client.sender.clone()
                 };
                 let _ = sender
@@ -490,7 +680,7 @@ async fn authenticate_registration(
     let Some(client) = state.clients.get_mut(client_id) else {
         return false;
     };
-    let Some(challenge) = client.challenge.take() else {
+    let Some(challenge) = client.challenges.remove(&IpFamily::of(source)) else {
         return false;
     };
     if challenge.source != source
@@ -518,34 +708,44 @@ async fn register_udp_addr(state: &SharedState, client_id: &str, udp_addr: Socke
             let Some(peer) = room.peers.get_mut(client_id) else {
                 continue;
             };
-            peer.udp_addr = Some(udp_addr);
-            if room.peers.len() == 2 && room.peers.values().all(|peer| peer.udp_addr.is_some()) {
-                let peers = room
-                    .peers
-                    .iter()
-                    .map(|(id, peer)| {
-                        (
-                            id.clone(),
-                            peer.sender.clone(),
-                            peer.udp_addr.expect("checked"),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                pair = Some((
-                    room_id.clone(),
-                    room.creator.clone(),
-                    room.session_nonce,
-                    peers,
-                ));
+            peer.endpoints.insert(udp_addr);
+            if room.peers.len() == 2 && room.selected_family.is_none() {
+                let family = select_common_family(room.peers.values());
+                if let Some(family) = family {
+                    room.selected_family = Some(family);
+                    let peers = room
+                        .peers
+                        .iter()
+                        .map(|(id, peer)| {
+                            (
+                                id.clone(),
+                                peer.sender.clone(),
+                                peer.endpoints.get(family).expect("common family checked"),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    pair = Some((
+                        room_id.clone(),
+                        room.creator.clone(),
+                        room.session_nonce,
+                        family,
+                        peers,
+                    ));
+                }
             }
             break;
         }
         (registered, pair)
     };
     if let Some(sender) = registered {
-        let _ = sender.send("REGISTERED\n".to_owned()).await;
+        let _ = sender
+            .send(format!(
+                "REGISTERED {}\n",
+                IpFamily::of(udp_addr).protocol_token()
+            ))
+            .await;
     }
-    if let Some((room_id, creator, nonce, peers)) = pair {
+    if let Some((room_id, creator, nonce, family, peers)) = pair {
         for (id, sender, _) in &peers {
             let other = peers
                 .iter()
@@ -556,8 +756,17 @@ async fn register_udp_addr(state: &SharedState, client_id: &str, udp_addr: Socke
                 .send(format!("PEER {} {role} {}\n", other.2, encode_hex(&nonce)))
                 .await;
         }
-        info!(room = %short_id(&room_id), "peer endpoints exchanged");
+        info!(room = %short_id(&room_id), ?family, "peer endpoints exchanged");
     }
+}
+
+fn select_common_family<'a>(peers: impl Iterator<Item = &'a Peer>) -> Option<IpFamily> {
+    let peers = peers.collect::<Vec<_>>();
+    [IpFamily::V6, IpFamily::V4].into_iter().find(|family| {
+        peers
+            .iter()
+            .all(|peer| peer.endpoints.get(*family).is_some())
+    })
 }
 
 fn registration_payload(
@@ -581,10 +790,13 @@ async fn rate_allow(state: &SharedState, ip: IpAddr, class: RateClass) -> bool {
     };
     let mut state = state.lock().await;
     let now = Instant::now();
-    let bucket = state.rates.entry((ip, class)).or_insert(TokenBucket {
-        tokens: capacity,
-        updated_at: now,
-    });
+    let bucket = state
+        .rates
+        .entry((ip_rate_key(ip), class))
+        .or_insert(TokenBucket {
+            tokens: capacity,
+            updated_at: now,
+        });
     bucket.tokens = (bucket.tokens
         + now.duration_since(bucket.updated_at).as_secs_f64() * refill_per_second)
         .min(capacity);
@@ -594,6 +806,20 @@ async fn rate_allow(state: &SharedState, ip: IpAddr, class: RateClass) -> bool {
     }
     bucket.tokens -= 1.0;
     true
+}
+
+fn ip_rate_key(ip: IpAddr) -> IpRateKey {
+    match ip {
+        IpAddr::V4(address) => IpRateKey::V4(address),
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                IpRateKey::V4(mapped)
+            } else {
+                let octets = address.octets();
+                IpRateKey::V6Prefix64(octets[..8].try_into().expect("fixed prefix length"))
+            }
+        }
+    }
 }
 
 async fn cleanup_expired_rooms(state: SharedState) {
@@ -700,6 +926,57 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[test]
+    fn registration_payload_supports_ipv6_addresses() {
+        let source: SocketAddr = "[2001:db8::10]:40000".parse().unwrap();
+        let payload = registration_payload("001122", &[1; 16], &[2; 16], source);
+        assert!(payload.ends_with("|[2001:db8::10]:40000"));
+    }
+
+    #[test]
+    fn common_family_prefers_ipv6_and_falls_back_to_ipv4() {
+        let (sender_a, _receiver_a) = mpsc::channel(1);
+        let (sender_b, _receiver_b) = mpsc::channel(1);
+        let mut first = Peer {
+            sender: sender_a,
+            endpoints: PeerEndpoints::default(),
+        };
+        let mut second = Peer {
+            sender: sender_b,
+            endpoints: PeerEndpoints::default(),
+        };
+        first
+            .endpoints
+            .insert("198.51.100.1:40000".parse().unwrap());
+        second
+            .endpoints
+            .insert("198.51.100.2:40001".parse().unwrap());
+        assert_eq!(
+            select_common_family([&first, &second].into_iter()),
+            Some(IpFamily::V4)
+        );
+
+        first
+            .endpoints
+            .insert("[2001:db8::1]:40000".parse().unwrap());
+        second
+            .endpoints
+            .insert("[2001:db8::2]:40001".parse().unwrap());
+        assert_eq!(
+            select_common_family([&first, &second].into_iter()),
+            Some(IpFamily::V6)
+        );
+    }
+
+    #[test]
+    fn ipv6_rate_limit_key_uses_64_bit_prefix() {
+        let first: IpAddr = "2001:db8:1234:5678::1".parse().unwrap();
+        let same_prefix: IpAddr = "2001:db8:1234:5678:ffff::2".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:1234:5679::1".parse().unwrap();
+        assert_eq!(ip_rate_key(first), ip_rate_key(same_prefix));
+        assert_ne!(ip_rate_key(first), ip_rate_key(other_prefix));
+    }
+
     #[tokio::test]
     async fn bounded_reader_rejects_oversized_lines() {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
@@ -738,12 +1015,16 @@ mod tests {
             ClientRecord {
                 sender,
                 registration_secret: secret,
-                challenge: Some(RegistrationChallenge {
-                    source,
-                    client_nonce,
-                    server_nonce,
-                    expires_at: Instant::now() + Duration::from_secs(5),
-                }),
+                challenges: HashMap::from([(
+                    IpFamily::V4,
+                    RegistrationChallenge {
+                        source,
+                        client_nonce,
+                        server_nonce,
+                        expires_at: Instant::now() + Duration::from_secs(5),
+                    },
+                )]),
+                supports_dual_stack: false,
             },
         );
         let payload = registration_payload(client_id, &client_nonce, &server_nonce, source);
@@ -777,12 +1058,16 @@ mod tests {
             ClientRecord {
                 sender,
                 registration_secret: secret,
-                challenge: Some(RegistrationChallenge {
-                    source,
-                    client_nonce,
-                    server_nonce,
-                    expires_at: Instant::now() + Duration::from_secs(5),
-                }),
+                challenges: HashMap::from([(
+                    IpFamily::V4,
+                    RegistrationChallenge {
+                        source,
+                        client_nonce,
+                        server_nonce,
+                        expires_at: Instant::now() + Duration::from_secs(5),
+                    },
+                )]),
+                supports_dual_stack: false,
             },
         );
         let payload = registration_payload(client_id, &client_nonce, &server_nonce, source);
@@ -808,12 +1093,16 @@ mod tests {
             .clients
             .get_mut(client_id)
             .unwrap()
-            .challenge = Some(RegistrationChallenge {
-            source,
-            client_nonce,
-            server_nonce,
-            expires_at: Instant::now() - Duration::from_secs(1),
-        });
+            .challenges
+            .insert(
+                IpFamily::V4,
+                RegistrationChallenge {
+                    source,
+                    client_nonce,
+                    server_nonce,
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                },
+            );
         assert!(
             !authenticate_registration(&state, client_id, source, client_nonce, server_nonce, tag,)
                 .await

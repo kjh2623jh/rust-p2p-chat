@@ -6,7 +6,7 @@
 
 공개 signaling 서버는 방 관리와 peer 연결 정보 교환만 담당한다. 실제 채팅 메시지는 signaling 서버를 거치지 않고 두 클라이언트가 UDP로 직접 주고받는다.
 
-네트워크는 현재 IPv4를 사용하며, 데스크톱 GUI는 `eframe`과 `egui`로 구성되어 있다.
+네트워크는 IPv4/IPv6 dual-stack을 사용하며, 양쪽 peer가 모두 지원하면 IPv6를 우선하고 그렇지 않으면 IPv4로 fallback한다. 데스크톱 GUI는 `eframe`과 `egui`로 구성되어 있다.
 
 ## 아키텍처
 
@@ -94,7 +94,7 @@ GUI와 네트워크 계층이 사용하는 명령과 이벤트 타입을 정의�
 - rand 0.9
 - TCP signaling
 - UDP hole punching
-- IPv4 networking
+- IPv4/IPv6 dual-stack networking
 
 ## 네트워크 프로토콜
 
@@ -158,8 +158,8 @@ PUNCH_ACK
 → 서버가 JOINED 응답
 → B가 UDP REGISTER 전송
 
-서버가 두 클라이언트의 공개 UDP endpoint 확인
-→ 양쪽에 PEER 전달
+서버가 두 클라이언트의 IPv4/IPv6 공개 UDP endpoint 확인
+→ 공통 주소 체계를 선택해 양쪽에 PEER 전달
 → 양쪽이 PUNCH 반복 전송
 → PUNCH 수신 시 PUNCH_ACK 응답
 → PUNCH_ACK 수신 시 P2P 연결 완료

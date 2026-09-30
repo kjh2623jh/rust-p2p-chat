@@ -19,6 +19,7 @@ P2P Chat은 계정이나 연락처 등록 없이 안전한 초대 코드 하나�
 - **전송 신뢰성:** 암호화된 ACK, 중복 제거, 제한된 재전송을 지원합니다.
 - **편리한 데스크톱 UI:** Enter로 방 입장과 메시지 전송이 가능하며, 연결 상태와 오류를 화면에서 확인할 수 있습니다.
 - **연결 복구 흐름:** 상대방이 나가도 방을 즉시 닫지 않아 같은 초대 코드로 다시 연결할 수 있습니다.
+- **IPv4/IPv6 dual-stack:** 두 환경에서 모두 사용할 수 있으면 IPv6를 우선하고, 그렇지 않으면 IPv4로 자동 전환합니다.
 - **Windows 렌더러 fallback:** DX12, Glow, Vulkan 순서로 별도 프로세스를 실행해 그래픽 드라이버 충돌에도 다음 렌더러를 시도합니다.
 
 ## 작동 방식
@@ -33,7 +34,7 @@ P2P Chat은 계정이나 연락처 등록 없이 안전한 초대 코드 하나�
 
 1. Client A가 signaling 서버에서 방과 안전한 초대 코드를 만듭니다.
 2. Client B가 전달받은 초대 코드로 방에 입장합니다.
-3. 서버가 두 클라이언트의 공개 UDP endpoint를 서로에게 전달합니다.
+3. 서버가 두 클라이언트에 공통으로 존재하는 IPv6 또는 IPv4 UDP endpoint를 선택해 전달합니다.
 4. 두 클라이언트가 UDP hole punching을 수행하고 암호화 세션을 만듭니다.
 5. 이후 채팅 메시지는 signaling 서버를 거치지 않고 두 클라이언트 사이에서 직접 오갑니다.
 
@@ -103,7 +104,7 @@ P2P Chat이 보호하는 범위와 P2P 방식 자체의 한계를 함께 확인�
 - 초대 비밀과 채팅 본문은 signaling 서버에 전송하거나 저장하지 않습니다.
 - 서버 로그에는 전체 방 ID, 초대 코드, 메시지 본문, 전체 endpoint를 기록하지 않습니다.
 - 초대 코드를 가진 사람은 방이 만료되기 전에 참여할 수 있습니다. 초대 코드를 공개 채널에 올리지 마세요.
-- 직접 P2P 연결 특성상 **상대방과 signaling 서버는 사용자의 공개 IP 주소를 알 수 있습니다.** 현재 relay, VPN, Tor 같은 IP 익명화 기능은 제공하지 않습니다.
+- 직접 P2P 연결 특성상 **상대방과 signaling 서버는 사용자의 공개 IPv4 또는 IPv6 주소를 알 수 있습니다.** 현재 relay, VPN, Tor 같은 IP 익명화 기능은 제공하지 않습니다.
 - 대칭 NAT나 엄격한 회사·학교 네트워크에서는 UDP hole punching이 실패할 수 있습니다. 현재 relay fallback은 없습니다.
 
 자세한 설계, 알려진 제한, 취약점 제보 방법은 [SECURITY.md](SECURITY.md)를 참고하세요. 초대 코드, IP 주소, 인증서 개인 키나 개인정보가 포함된 보안 문제는 공개 Issue가 아닌 GitHub Private Vulnerability Reporting으로 알려 주세요.
@@ -159,8 +160,12 @@ export P2P_TLS_CERT_PATH=/etc/letsencrypt/live/chat.example.com/fullchain.pem
 export P2P_TLS_KEY_PATH=/etc/letsencrypt/live/chat.example.com/privkey.pem
 export P2P_TCP_BIND=0.0.0.0:9000
 export P2P_UDP_BIND=0.0.0.0:9001
+export P2P_TCP_BIND_V6='[::]:9000'
+export P2P_UDP_BIND_V6='[::]:9001'
 RUST_LOG=info ./target/release/server
 ```
+
+`P2P_TCP_BIND_V6`와 `P2P_UDP_BIND_V6`는 선택 사항입니다. 서버에 공용 IPv6 주소와 IPv6 방화벽·라우팅이 준비된 경우에만 설정하세요. IPv4와 IPv6 listener는 분리되어 있으며, IPv6 listener는 IPv4-mapped 연결을 받지 않습니다.
 
 방화벽과 클라우드 네트워크 보안 규칙에서 다음 포트를 허용해야 합니다.
 
@@ -168,6 +173,8 @@ RUST_LOG=info ./target/release/server
 | ------------------------- | -------- | --------: |
 | TLS signaling             | TCP      |      9000 |
 | UDP 등록 및 P2P 연결 보조 | UDP      |      9001 |
+
+IPv6를 제공하려면 서버 도메인에 A 레코드와 함께 AAAA 레코드를 추가해야 합니다. AAAA 레코드는 IPv6 listener와 외부 연결을 먼저 검증한 후 공개하세요.
 
 클라이언트가 자체 서버를 사용하도록 하려면 서버 인증서의 DNS 이름과 접속 주소를 지정합니다.
 
