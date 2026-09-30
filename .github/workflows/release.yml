@@ -147,6 +147,28 @@ jobs:
           cargo build --locked --release --features client --bin client \
             --target x86_64-apple-darwin
 
+      - name: Create macOS app icon
+        run: |
+          set -euo pipefail
+          SOURCE_ICON="assets/app-icon.png"
+          ICONSET="$RUNNER_TEMP/AppIcon.iconset"
+          APP_ICON="$RUNNER_TEMP/AppIcon.icns"
+          test -f "$SOURCE_ICON"
+          mkdir -p "$ICONSET"
+          sips -z 16 16 "$SOURCE_ICON" --out "$ICONSET/icon_16x16.png"
+          sips -z 32 32 "$SOURCE_ICON" --out "$ICONSET/icon_16x16@2x.png"
+          sips -z 32 32 "$SOURCE_ICON" --out "$ICONSET/icon_32x32.png"
+          sips -z 64 64 "$SOURCE_ICON" --out "$ICONSET/icon_32x32@2x.png"
+          sips -z 128 128 "$SOURCE_ICON" --out "$ICONSET/icon_128x128.png"
+          sips -z 256 256 "$SOURCE_ICON" --out "$ICONSET/icon_128x128@2x.png"
+          sips -z 256 256 "$SOURCE_ICON" --out "$ICONSET/icon_256x256.png"
+          sips -z 512 512 "$SOURCE_ICON" --out "$ICONSET/icon_256x256@2x.png"
+          sips -z 512 512 "$SOURCE_ICON" --out "$ICONSET/icon_512x512.png"
+          cp "$SOURCE_ICON" "$ICONSET/icon_512x512@2x.png"
+          iconutil -c icns "$ICONSET" -o "$APP_ICON"
+          test -s "$APP_ICON"
+          echo "APP_ICON_PATH=$APP_ICON" >> "$GITHUB_ENV"
+
       - name: Create and sign Universal app bundle
         env:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
@@ -164,18 +186,20 @@ jobs:
           X86_64_BINARY="target/x86_64-apple-darwin/release/client"
           VERSION="${GITHUB_REF_NAME#v}"
 
-          mkdir -p "$APP_DIR/Contents/MacOS"
+          mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
           test -x "$ARM64_BINARY"
           test -x "$X86_64_BINARY"
           lipo -create "$ARM64_BINARY" "$X86_64_BINARY" -output "$EXECUTABLE"
           lipo "$EXECUTABLE" -verify_arch arm64 x86_64
           lipo -info "$EXECUTABLE"
           chmod +x "$EXECUTABLE"
+          ditto "$APP_ICON_PATH" "$APP_DIR/Contents/Resources/AppIcon.icns"
           /usr/bin/plutil -create xml1 "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleDevelopmentRegion string ko" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string P2P Chat" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string p2p-chat" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $APPLE_BUNDLE_ID" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon.icns" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleName string P2P Chat" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$PLIST"
@@ -187,6 +211,8 @@ jobs:
             --sign "$APPLE_SIGNING_IDENTITY" "$APP_DIR"
           codesign --verify --deep --strict --verbose=2 "$APP_DIR"
           codesign -dvv "$APP_DIR" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$PLIST")" = "AppIcon.icns"
+          test -s "$APP_DIR/Contents/Resources/AppIcon.icns"
 
       - name: Notarize and staple app bundle
         env:
@@ -221,6 +247,10 @@ jobs:
           mkdir -p "$DMG_ROOT"
           ditto "$APP_DIR" "$DMG_ROOT/P2P Chat.app"
           ln -s /Applications "$DMG_ROOT/Applications"
+          ditto "$APP_ICON_PATH" "$DMG_ROOT/.VolumeIcon.icns"
+          SETFILE="$(xcrun -f SetFile)"
+          "$SETFILE" -a V "$DMG_ROOT/.VolumeIcon.icns"
+          "$SETFILE" -a C "$DMG_ROOT"
           hdiutil create -volname "P2P Chat" -srcfolder "$DMG_ROOT" \
             -ov -format UDZO "$DMG_PATH"
           codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"

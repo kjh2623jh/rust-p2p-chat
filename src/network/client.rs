@@ -2,7 +2,7 @@ use super::{NetworkCommand, NetworkError, NetworkEvent, PublicRoomSummary};
 use crate::protocol::{
     InviteCode, MAX_DATAGRAM, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS, MAX_SIGNAL_LINE,
     PROTOCOL_VERSION, decode_hex, decode_public_room_title, encode_hex, encode_public_room_title,
-    normalize_public_room_title,
+    normalize_nickname, normalize_public_room_title,
 };
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -170,6 +170,7 @@ struct RoomContext {
     security: RoomSecurity,
     room_id: [u8; 16],
     session_nonce: [u8; 16],
+    local_nickname: String,
 }
 
 enum RoomSecurity {
@@ -178,10 +179,14 @@ enum RoomSecurity {
 }
 
 enum PendingRoom {
-    Private(InviteCode),
+    Private {
+        invite: InviteCode,
+        nickname: String,
+    },
     Public {
         room_id: [u8; 16],
         expected_title: Option<String>,
+        nickname: String,
     },
 }
 
@@ -280,10 +285,15 @@ struct SecurePeer {
     packets_this_second: u32,
     public_room: bool,
     safety_number: Option<String>,
+    local_nickname: String,
+    peer_nickname: Option<String>,
 }
 
 impl SecurePeer {
     fn new(address: SocketAddr, initiator: bool, room: &RoomContext) -> Result<Self, NetworkError> {
+        let local_nickname = normalize_nickname(&room.local_nickname)
+            .filter(|nickname| nickname == &room.local_nickname)
+            .ok_or(NetworkError::NicknameInvalid)?;
         let public_room = matches!(room.security, RoomSecurity::Public);
         let pattern = if public_room {
             PUBLIC_NOISE_PATTERN
@@ -352,6 +362,8 @@ impl SecurePeer {
             packets_this_second: 0,
             public_room,
             safety_number: None,
+            local_nickname,
+            peer_nickname: None,
         })
     }
 
@@ -518,17 +530,22 @@ impl NetworkClient {
                 command = self.command_rx.recv() => {
                     let Some(command) = command else { return Ok(RunOutcome::CommandChannelClosed) };
                     match command {
-                        NetworkCommand::CreateRoom => {
+                        NetworkCommand::CreateRoom { nickname } => {
                             if room.is_none() && pending_room.is_none() {
+                                let Some(nickname) = normalize_nickname(&nickname) else {
+                                    let _ = self.event_tx.send(NetworkEvent::Error(NetworkError::NicknameInvalid)).await;
+                                    continue;
+                                };
                                 let invite = InviteCode::generate();
                                 writer.write_all(format!("CREATE {}\n", invite.room_id_hex()).as_bytes()).await?;
-                                pending_room = Some(PendingRoom::Private(invite));
+                                pending_room = Some(PendingRoom::Private { invite, nickname });
                             }
                         }
-                        NetworkCommand::CreatePublicRoom(title) => {
+                        NetworkCommand::CreatePublicRoom { title, nickname } => {
                             if room.is_none() && pending_room.is_none()
-                                && let (Some(title), room_id) = (
+                                && let (Some(title), Some(nickname), room_id) = (
                                     normalize_public_room_title(&title),
+                                    normalize_nickname(&nickname),
                                     random_bytes::<16>(),
                                 )
                             {
@@ -540,23 +557,30 @@ impl NetworkClient {
                                 pending_room = Some(PendingRoom::Public {
                                     room_id,
                                     expected_title: Some(title),
+                                    nickname,
                                 });
                             }
                         }
-                        NetworkCommand::JoinRoom(invite) => {
+                        NetworkCommand::JoinRoom { invite, nickname } => {
                             if room.is_none() && pending_room.is_none() {
+                                let Some(nickname) = normalize_nickname(&nickname) else {
+                                    let _ = self.event_tx.send(NetworkEvent::Error(NetworkError::NicknameInvalid)).await;
+                                    continue;
+                                };
                                 writer.write_all(format!("JOIN {}\n", invite.room_id_hex()).as_bytes()).await?;
-                                pending_room = Some(PendingRoom::Private(invite));
+                                pending_room = Some(PendingRoom::Private { invite, nickname });
                             }
                         }
-                        NetworkCommand::JoinPublicRoom(room_id) => {
+                        NetworkCommand::JoinPublicRoom { room_id, nickname } => {
                             if room.is_none() && pending_room.is_none()
                                 && let Some(decoded) = decode_hex::<16>(&room_id)
+                                && let Some(nickname) = normalize_nickname(&nickname)
                             {
                                 writer.write_all(format!("JOIN_PUBLIC {room_id}\n").as_bytes()).await?;
                                 pending_room = Some(PendingRoom::Public {
                                     room_id: decoded,
                                     expected_title: None,
+                                    nickname,
                                 });
                             }
                         }
@@ -808,11 +832,16 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 send_protocol_error(event_tx).await;
                 return Ok(ServerAction::Continue);
             };
-            let (Some(room_id), Some(session_nonce), Some(PendingRoom::Private(invite))) = (
+            let (
+                Some(room_id),
+                Some(session_nonce),
+                Some(PendingRoom::Private { invite, nickname }),
+            ) = (
                 decode_hex::<16>(room_id),
                 decode_hex::<16>(session_nonce),
                 pending_room.take(),
-            ) else {
+            )
+            else {
                 send_protocol_error(event_tx).await;
                 return Ok(ServerAction::Continue);
             };
@@ -826,6 +855,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 security: RoomSecurity::Private(invite),
                 room_id,
                 session_nonce,
+                local_nickname: nickname,
             });
             *registration = begin_registration(udp, udp_servers, client_id).await?;
             if created {
@@ -937,6 +967,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 Some(PendingRoom::Public {
                     room_id: pending_id,
                     expected_title,
+                    nickname,
                 }),
             ) = (
                 decode_hex::<16>(room_id),
@@ -961,6 +992,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 security: RoomSecurity::Public,
                 room_id,
                 session_nonce,
+                local_nickname: nickname,
             });
             *registration = begin_registration(udp, udp_servers, client_id).await?;
             let event = if created {
@@ -1187,6 +1219,9 @@ async fn handle_plaintext(
 ) -> Result<(), NetworkError> {
     match plaintext.first().copied() {
         Some(PLAIN_READY) => {
+            let nickname =
+                decode_ready_nickname(plaintext).ok_or(NetworkError::PeerAuthenticationFailed)?;
+            peer.peer_nickname = Some(nickname);
             peer.ready_received = true;
             let packet = peer.encrypt(&[PLAIN_READY_ACK])?;
             udp.send_to(&packet, peer.address)
@@ -1237,9 +1272,13 @@ async fn handle_plaintext(
 
 async fn maybe_mark_connected(peer: &mut SecurePeer, event_tx: &mpsc::Sender<NetworkEvent>) {
     if !peer.connected && peer.ready_received && peer.ready_acked {
+        let Some(nickname) = peer.peer_nickname.clone() else {
+            return;
+        };
         peer.connected = true;
         let _ = event_tx
             .send(NetworkEvent::PeerConnected {
+                nickname,
                 safety_number: peer.safety_number.clone(),
             })
             .await;
@@ -1257,12 +1296,23 @@ fn handshake_safety_number(handshake: &HandshakeState) -> String {
 }
 
 async fn send_ready(peer: &mut SecurePeer, udp: &UdpSockets) -> Result<(), NetworkError> {
-    let packet = peer.encrypt(&[PLAIN_READY])?;
+    let mut plaintext = Vec::with_capacity(1 + peer.local_nickname.len());
+    plaintext.push(PLAIN_READY);
+    plaintext.extend_from_slice(peer.local_nickname.as_bytes());
+    let packet = peer.encrypt(&plaintext)?;
     udp.send_to(&packet, peer.address)
         .await
         .map_err(|error| NetworkError::Transport(safe_io_error(&error)))?;
     peer.last_ready_send = Instant::now();
     Ok(())
+}
+
+fn decode_ready_nickname(plaintext: &[u8]) -> Option<String> {
+    if plaintext.first().copied() != Some(PLAIN_READY) {
+        return None;
+    }
+    let nickname = std::str::from_utf8(&plaintext[1..]).ok()?;
+    normalize_nickname(nickname).filter(|normalized| normalized == nickname)
 }
 
 async fn tick_peer(
@@ -1573,6 +1623,7 @@ mod tests {
             security: RoomSecurity::Private(invite.clone()),
             room_id: invite.room_id(),
             session_nonce: [9; 16],
+            local_nickname: "철수".to_owned(),
         };
         let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut initiator = SecurePeer::new(address, true, &room).unwrap();
@@ -1605,11 +1656,13 @@ mod tests {
             security: RoomSecurity::Private(invite_a.clone()),
             room_id: invite_a.room_id(),
             session_nonce: [4; 16],
+            local_nickname: "첫 번째".to_owned(),
         };
         let room_b = RoomContext {
             security: RoomSecurity::Private(invite_b.clone()),
             room_id: invite_a.room_id(),
             session_nonce: [4; 16],
+            local_nickname: "두 번째".to_owned(),
         };
         let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let initiator = SecurePeer::new(address, true, &room_a).unwrap();
@@ -1631,6 +1684,7 @@ mod tests {
             security: RoomSecurity::Public,
             room_id: [3; 16],
             session_nonce: [7; 16],
+            local_nickname: "공개 사용자".to_owned(),
         };
         let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut initiator = SecurePeer::new(address, true, &room).unwrap();
@@ -1651,5 +1705,15 @@ mod tests {
             .read_message(&response[..size], &mut scratch)
             .unwrap();
         assert_eq!(responder_number, handshake_safety_number(&initiator_hs));
+    }
+
+    #[test]
+    fn ready_packet_nickname_is_validated() {
+        let mut ready = vec![PLAIN_READY];
+        ready.extend_from_slice("닉네임".as_bytes());
+        assert_eq!(decode_ready_nickname(&ready).as_deref(), Some("닉네임"));
+        assert!(decode_ready_nickname(&[PLAIN_READY]).is_none());
+        assert!(decode_ready_nickname(&[PLAIN_READY, b'a', b'\n']).is_none());
+        assert!(decode_ready_nickname(&[PLAIN_MESSAGE, b'a']).is_none());
     }
 }

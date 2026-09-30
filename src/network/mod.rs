@@ -18,10 +18,21 @@ impl PublicRoomSummary {
 
 #[derive(Debug)]
 pub enum NetworkCommand {
-    CreateRoom,
-    CreatePublicRoom(String),
-    JoinRoom(InviteCode),
-    JoinPublicRoom(String),
+    CreateRoom {
+        nickname: String,
+    },
+    CreatePublicRoom {
+        title: String,
+        nickname: String,
+    },
+    JoinRoom {
+        invite: InviteCode,
+        nickname: String,
+    },
+    JoinPublicRoom {
+        room_id: String,
+        nickname: String,
+    },
     RefreshPublicRooms,
     LeaveRoom,
     SendMessage(String),
@@ -32,10 +43,22 @@ pub enum NetworkEvent {
     ServerConnected,
     ServerDisconnected,
 
-    RoomCreated { invite: String, fingerprint: String },
-    JoinedRoom { invite: String, fingerprint: String },
-    PublicRoomCreated { room_id: String, title: String },
-    PublicRoomJoined { room_id: String, title: String },
+    RoomCreated {
+        invite: String,
+        fingerprint: String,
+    },
+    JoinedRoom {
+        invite: String,
+        fingerprint: String,
+    },
+    PublicRoomCreated {
+        room_id: String,
+        title: String,
+    },
+    PublicRoomJoined {
+        room_id: String,
+        title: String,
+    },
     PublicRooms(Vec<PublicRoomSummary>),
 
     RoomFull,
@@ -44,15 +67,24 @@ pub enum NetworkEvent {
     PublicRoomNotFound,
     AlreadyInRoom,
 
-    PeerConnected { safety_number: Option<String> },
+    PeerConnected {
+        nickname: String,
+        safety_number: Option<String>,
+    },
     PeerDisconnected,
     RoomExpired,
 
     P2pFailed,
 
-    MessagePending { id: u64, text: String },
+    MessagePending {
+        id: u64,
+        text: String,
+    },
     MessageDelivered(u64),
-    MessageFailed { id: u64, reason: String },
+    MessageFailed {
+        id: u64,
+        reason: String,
+    },
     MessageReceived(String),
 
     Error(NetworkError),
@@ -66,6 +98,7 @@ pub enum NetworkError {
     PeerAuthenticationFailed,
     RateLimited,
     PublicRoomLimit,
+    NicknameInvalid,
     MessageTooLong,
     Transport(String),
 }
@@ -90,6 +123,9 @@ impl std::fmt::Display for NetworkError {
                 formatter,
                 "공개방이 너무 많아 지금은 새 공개방을 만들 수 없습니다. 잠시 후 다시 시도해 주세요."
             ),
+            Self::NicknameInvalid => {
+                write!(formatter, "닉네임 형식이 올바르지 않습니다.")
+            }
             Self::MessageTooLong => {
                 write!(formatter, "메시지는 500자, 1024바이트 이하여야 합니다.")
             }

@@ -4,13 +4,15 @@ use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
 use zeroize::Zeroize;
 
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 pub const MAX_SIGNAL_LINE: usize = 512;
 pub const MAX_DATAGRAM: usize = 1200;
 pub const MAX_MESSAGE_CHARS: usize = 500;
 pub const MAX_MESSAGE_BYTES: usize = 1024;
 pub const MAX_PUBLIC_ROOM_TITLE_CHARS: usize = 40;
 pub const MAX_PUBLIC_ROOM_TITLE_BYTES: usize = 120;
+pub const MAX_NICKNAME_CHARS: usize = 20;
+pub const MAX_NICKNAME_BYTES: usize = 80;
 pub const INVITE_PREFIX: &str = "P2P2-";
 const ROOM_CONTEXT: &[u8] = b"p2p-chat/room/v2";
 const FINGERPRINT_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -124,6 +126,18 @@ pub fn normalize_public_room_title(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
+pub fn normalize_nickname(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > MAX_NICKNAME_CHARS
+        || value.len() > MAX_NICKNAME_BYTES
+        || value.chars().any(is_unsafe_title_character)
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 pub fn encode_public_room_title(value: &str) -> Option<String> {
     normalize_public_room_title(value).map(|title| URL_SAFE_NO_PAD.encode(title.as_bytes()))
 }
@@ -199,5 +213,14 @@ mod tests {
         assert!(normalize_public_room_title("  ").is_none());
         assert!(normalize_public_room_title("앞\u{202e}뒤").is_none());
         assert!(normalize_public_room_title(&"a".repeat(41)).is_none());
+    }
+
+    #[test]
+    fn nickname_validation_rejects_unsafe_or_oversized_values() {
+        assert_eq!(normalize_nickname("  철수  ").as_deref(), Some("철수"));
+        assert!(normalize_nickname("").is_none());
+        assert!(normalize_nickname("앞\n뒤").is_none());
+        assert!(normalize_nickname("앞\u{202e}뒤").is_none());
+        assert!(normalize_nickname(&"a".repeat(21)).is_none());
     }
 }

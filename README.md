@@ -16,6 +16,7 @@ P2P Chat은 계정이나 연락처 등록 없이 공개방 목록 또는 안전�
 - **종단간 암호화:** Noise Protocol 기반 암호화 세션으로 메시지를 보호합니다.
 - **공개방 목록:** 공개방은 코드 없이 입장하며, 만석인 방도 상태를 확인할 수 있도록 목록 아래에 표시됩니다.
 - **비공개 초대:** 목록에 노출되지 않는 방은 인증된 보안 초대 코드로만 입장합니다.
+- **암호화된 닉네임 교환:** 닉네임은 signaling 서버가 아니라 연결된 상대에게만 암호화해 전달합니다.
 - **1:1 대화:** 방마다 최대 두 명만 참여할 수 있습니다.
 - **전송 신뢰성:** 암호화된 ACK, 중복 제거, 제한된 재전송을 지원합니다.
 - **편리한 데스크톱 UI:** Enter로 방 입장과 메시지 전송이 가능하며, 연결 상태와 오류를 화면에서 확인할 수 있습니다.
@@ -79,6 +80,8 @@ shasum -a 256 p2p-chat-vX.Y.Z-macos-universal.dmg
 
 ## 사용 방법
 
+로비의 **내 닉네임**에서 이번 실행에 사용할 이름을 설정합니다. 처음 실행하면 임의의 `익명-0000` 형식이 제안되며, 닉네임은 최대 20자입니다. 닉네임은 계정이나 신원 인증 수단이 아니며 앱을 종료하면 저장되지 않습니다.
+
 ### 공개방 만들기와 입장
 
 1. **공개방**을 선택하고 목록에 표시할 이름을 입력합니다.
@@ -112,7 +115,7 @@ P2P Chat이 보호하는 범위와 P2P 방식 자체의 한계를 함께 확인�
 - 비공개방 채팅은 초대 비밀을 사용하는 `Noise_NNpsk0_25519_ChaChaPoly_SHA256` 세션으로 인증·암호화됩니다.
 - 공개방 채팅은 `Noise_NN_25519_ChaChaPoly_SHA256` 세션으로 암호화되지만 초대 비밀 기반 인증은 없습니다. 표시되는 안전번호를 상대방과 비교해야 signaling 서버를 포함한 능동적 중간자 공격을 탐지할 수 있습니다.
 - 공개방 목록에는 방 ID, 제목, 현재 인원만 표시되며 채팅 본문은 포함되지 않습니다.
-- 초대 비밀과 채팅 본문은 signaling 서버에 전송하거나 저장하지 않습니다.
+- 초대 비밀, 닉네임과 채팅 본문은 signaling 서버에 전송하거나 저장하지 않습니다. 닉네임은 Noise 세션이 완성된 뒤 암호화된 P2P 패킷으로 교환됩니다.
 - 서버 로그에는 전체 방 ID, 초대 코드, 메시지 본문, 전체 endpoint를 기록하지 않습니다.
 - 초대 코드를 가진 사람은 방이 만료되기 전에 참여할 수 있습니다. 초대 코드를 공개 채널에 올리지 마세요.
 - 직접 P2P 연결 특성상 **상대방과 signaling 서버는 사용자의 공개 IPv4 또는 IPv6 주소를 알 수 있습니다.** 현재 relay, VPN, Tor 같은 IP 익명화 기능은 제공하지 않습니다.
@@ -156,11 +159,19 @@ cargo run --features client --bin client -- --renderer glow
 cargo run --features client --bin client -- --renderer vulkan
 ```
 
+Windows용 다중 해상도 ICO를 마스터 PNG에서 다시 만들려면 Windows PowerShell에서 다음을 실행합니다.
+
+```powershell
+.\scripts\generate-windows-icon.ps1
+```
+
+macOS용 ICNS는 release workflow가 같은 `assets/app-icon.png`에서 자동 생성합니다.
+
 ## signaling 서버 직접 운영하기
 
 서버 바이너리는 GUI 의존성 없이 별도로 빌드됩니다.
 
-공개방 목록은 signaling protocol v3를 사용합니다. 새 클라이언트를 배포하기 전에 같은 커밋의 서버를 먼저 배포해야 하며, 이전 protocol v2 클라이언트와 서버는 v3와 연결되지 않습니다.
+공개방 목록과 암호화된 닉네임 교환은 signaling protocol v4를 사용합니다. 새 클라이언트를 배포하기 전에 같은 커밋의 서버를 먼저 배포해야 하며, 이전 protocol 클라이언트와 서버는 v4와 연결되지 않습니다.
 
 ```bash
 cargo build --locked --release --no-default-features --bin server
@@ -203,6 +214,11 @@ cargo run --features client --bin client
 ## 프로젝트 구조
 
 ```text
+assets/
+├─ app-icon.png         # 공통 1024px 앱 아이콘
+└─ app-icon.ico         # Windows 다중 해상도 실행 파일 아이콘
+scripts/
+└─ generate-windows-icon.ps1
 src/
 ├─ bin/
 │  ├─ client.rs          # 데스크톱 클라이언트 진입점

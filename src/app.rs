@@ -6,13 +6,14 @@ use std::{
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, RichText, Stroke, StrokeKind,
 };
+use rand::Rng;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use zeroize::Zeroize;
 
 use crate::network::{NetworkCommand, NetworkEvent, PublicRoomSummary};
 use crate::protocol::{
-    InviteCode, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS, MAX_PUBLIC_ROOM_TITLE_CHARS,
-    normalize_public_room_title,
+    InviteCode, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS, MAX_NICKNAME_CHARS,
+    MAX_PUBLIC_ROOM_TITLE_CHARS, normalize_nickname, normalize_public_room_title,
 };
 
 const BACKGROUND: Color32 = Color32::from_rgb(7, 7, 8);
@@ -50,10 +51,10 @@ struct Notice {
     detail: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum MessageAuthor {
     Me,
-    Peer,
+    Peer(String),
 }
 
 struct ChatMessage {
@@ -80,6 +81,8 @@ pub struct ChatApp {
     current_invite: Option<String>,
     current_room_public: bool,
     safety_number: Option<String>,
+    nickname: String,
+    peer_nickname: Option<String>,
     peer_connected: bool,
     room_visibility: RoomVisibility,
     public_room_title: String,
@@ -115,6 +118,8 @@ impl ChatApp {
             current_invite: None,
             current_room_public: false,
             safety_number: None,
+            nickname: format!("익명-{:04}", rand::rng().random_range(1000..=9999)),
+            peer_nickname: None,
             peer_connected: false,
             room_visibility: RoomVisibility::Public,
             public_room_title: String::new(),
@@ -271,23 +276,29 @@ impl ChatApp {
                         self.focus_room_code = true;
                     }
                 }
-                NetworkEvent::PeerConnected { safety_number } => {
+                NetworkEvent::PeerConnected {
+                    nickname,
+                    safety_number,
+                } => {
                     if self.current_room.is_some() {
                         self.peer_connected = true;
+                        self.peer_nickname = Some(nickname.clone());
                         self.safety_number = safety_number.clone();
                         if let Some(number) = safety_number {
                             self.set_notice(
                                 NoticeTone::Success,
                                 "공개방 P2P 연결 완료",
                                 format!(
-                                    "안전번호 {number}가 상대 화면과 같은지 다른 채널로 확인하세요."
+                                    "{nickname}님과 연결되었습니다. 안전번호 {number}가 상대 화면과 같은지 다른 채널로 확인하세요."
                                 ),
                             );
                         } else {
                             self.set_notice(
                                 NoticeTone::Success,
                                 "P2P 연결 완료",
-                                "메시지는 서버를 거치지 않고 상대방에게 직접 전송됩니다.",
+                                format!(
+                                    "{nickname}님과 연결되었습니다. 메시지는 서버를 거치지 않고 직접 전송됩니다."
+                                ),
                             );
                         }
                         self.focus_message = true;
@@ -297,6 +308,7 @@ impl ChatApp {
                     if self.current_room.is_some() {
                         self.peer_connected = false;
                         self.safety_number = None;
+                        self.peer_nickname = None;
                         self.message_input.clear();
                         self.focus_message = false;
                         self.set_notice(
@@ -362,7 +374,11 @@ impl ChatApp {
                     if self.current_room.is_some() && self.peer_connected {
                         self.messages.push(ChatMessage {
                             id: None,
-                            author: MessageAuthor::Peer,
+                            author: MessageAuthor::Peer(
+                                self.peer_nickname
+                                    .clone()
+                                    .unwrap_or_else(|| "상대방".to_owned()),
+                            ),
                             text: message,
                             delivery: DeliveryState::Received,
                         });
@@ -389,6 +405,7 @@ impl ChatApp {
         self.current_invite = invite;
         self.current_room_public = public;
         self.safety_number = None;
+        self.peer_nickname = None;
         self.room_code.zeroize();
         self.room_request_pending = false;
         self.peer_connected = false;
@@ -400,6 +417,7 @@ impl ChatApp {
         self.current_room = None;
         self.current_room_public = false;
         self.safety_number = None;
+        self.peer_nickname = None;
         if let Some(mut invite) = self.current_invite.take() {
             invite.zeroize();
         }
@@ -455,8 +473,11 @@ impl ChatApp {
     }
 
     fn create_room(&mut self) {
+        let Some(nickname) = self.validated_nickname() else {
+            return;
+        };
         let command = match self.room_visibility {
-            RoomVisibility::Private => NetworkCommand::CreateRoom,
+            RoomVisibility::Private => NetworkCommand::CreateRoom { nickname },
             RoomVisibility::Public => {
                 let Some(title) = normalize_public_room_title(&self.public_room_title) else {
                     self.set_notice(
@@ -466,7 +487,7 @@ impl ChatApp {
                     );
                     return;
                 };
-                NetworkCommand::CreatePublicRoom(title)
+                NetworkCommand::CreatePublicRoom { title, nickname }
             }
         };
         if self.send_command(command) {
@@ -483,7 +504,13 @@ impl ChatApp {
         if room.is_full() || self.room_request_pending {
             return;
         }
-        if self.send_command(NetworkCommand::JoinPublicRoom(room.room_id.clone())) {
+        let Some(nickname) = self.validated_nickname() else {
+            return;
+        };
+        if self.send_command(NetworkCommand::JoinPublicRoom {
+            room_id: room.room_id.clone(),
+            nickname,
+        }) {
             self.room_request_pending = true;
             self.set_notice(
                 NoticeTone::Info,
@@ -510,6 +537,9 @@ impl ChatApp {
     }
 
     fn join_room(&mut self) {
+        let Some(nickname) = self.validated_nickname() else {
+            return;
+        };
         let invite = match self.room_code.trim().parse::<InviteCode>() {
             Ok(invite) => invite,
             Err(()) => {
@@ -524,7 +554,7 @@ impl ChatApp {
         };
         let fingerprint = invite.fingerprint();
 
-        if self.send_command(NetworkCommand::JoinRoom(invite)) {
+        if self.send_command(NetworkCommand::JoinRoom { invite, nickname }) {
             self.room_request_pending = true;
             self.set_notice(
                 NoticeTone::Info,
@@ -532,6 +562,18 @@ impl ChatApp {
                 "보안 연결을 준비하고 있습니다.",
             );
         }
+    }
+
+    fn validated_nickname(&mut self) -> Option<String> {
+        let nickname = normalize_nickname(&self.nickname);
+        if nickname.is_none() {
+            self.set_notice(
+                NoticeTone::Warning,
+                "닉네임을 확인해 주세요",
+                format!("닉네임은 1~{MAX_NICKNAME_CHARS}자로 입력해 주세요."),
+            );
+        }
+        nickname
     }
 
     fn leave_room(&mut self) {
@@ -580,13 +622,11 @@ impl ChatApp {
             .show(ui, |ui| {
                 ui.set_height(30.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("P2P")
-                            .size(15.0)
-                            .strong()
-                            .color(PRIMARY_HOVER),
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../assets/app-icon.png"))
+                            .fit_to_exact_size(egui::vec2(24.0, 24.0)),
                     );
-                    ui.label(RichText::new("Chat").size(15.0).strong().color(TEXT));
+                    ui.label(RichText::new("P2P Chat").size(15.0).strong().color(TEXT));
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let (label, color) = if self.server_connected {
@@ -671,7 +711,14 @@ impl ChatApp {
                 }
 
                 if self.peer_connected {
-                    status_pill(ui, "상대방 연결됨", SUCCESS);
+                    status_pill(
+                        ui,
+                        &format!(
+                            "{} 연결됨",
+                            self.peer_nickname.as_deref().unwrap_or("상대방")
+                        ),
+                        SUCCESS,
+                    );
                 } else if room_fingerprint.is_some() {
                     status_pill(ui, "상대방 대기 중", WARNING);
                 }
@@ -746,6 +793,30 @@ impl ChatApp {
                             ui.set_width(ui.available_width());
                             let enabled = self.server_connected && !self.room_request_pending;
 
+                            ui.label(RichText::new("내 닉네임").size(15.0).strong());
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("상대방에게만 암호화해 전달되며 서버에는 저장되지 않습니다.")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                            ui.add_space(8.0);
+                            let nickname_response = ui.add_enabled(
+                                !self.room_request_pending,
+                                egui::TextEdit::singleline(&mut self.nickname)
+                                    .hint_text("닉네임")
+                                    .char_limit(MAX_NICKNAME_CHARS)
+                                    .desired_width(f32::INFINITY)
+                                    .text_color(TEXT)
+                                    .background_color(SURFACE_RAISED)
+                                    .margin(Margin::symmetric(12, 10)),
+                            );
+                            paint_focus_ring(ui, &nickname_response, 6);
+                            let valid_nickname = normalize_nickname(&self.nickname).is_some();
+                            ui.add_space(16.0);
+                            ui.separator();
+                            ui.add_space(16.0);
+
                             ui.label(RichText::new("새 방 만들기").size(16.0).strong());
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
@@ -795,7 +866,7 @@ impl ChatApp {
                                     );
                                     ui.add_space(10.0);
                                     let create_response = ui.add_enabled(
-                                        enabled && valid_title,
+                                        enabled && valid_title && valid_nickname,
                                         egui::Button::new(
                                             RichText::new(if self.room_request_pending {
                                                 "처리 중..."
@@ -812,7 +883,10 @@ impl ChatApp {
                                     );
                                     paint_focus_ring(ui, &create_response, 6);
                                     if create_response.clicked()
-                                        || (enter_pressed && enabled && valid_title)
+                                        || (enter_pressed
+                                            && enabled
+                                            && valid_title
+                                            && valid_nickname)
                                     {
                                         self.create_room();
                                     }
@@ -825,7 +899,7 @@ impl ChatApp {
                                     );
                                     ui.add_space(10.0);
                                     let create_response = ui.add_enabled(
-                                        enabled,
+                                        enabled && valid_nickname,
                                         egui::Button::new(
                                             RichText::new(if self.room_request_pending {
                                                 "처리 중..."
@@ -932,7 +1006,9 @@ impl ChatApp {
                                                         let join = ui.add_enabled(
                                                             !full
                                                                 && self.server_connected
-                                                                && !self.room_request_pending,
+                                                                && !self.room_request_pending
+                                                                && normalize_nickname(&self.nickname)
+                                                                    .is_some(),
                                                             egui::Button::new(if full {
                                                                 "만석"
                                                             } else {
@@ -999,6 +1075,7 @@ impl ChatApp {
                                 let enter_pressed = response.lost_focus()
                                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
                                 let can_join = enabled
+                                    && normalize_nickname(&self.nickname).is_some()
                                     && self.room_code.trim().parse::<InviteCode>().is_ok();
                                 let join_response = ui.add_enabled(
                                     can_join,
@@ -1054,7 +1131,10 @@ impl ChatApp {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let (label, color) = if self.peer_connected {
-                            ("상대방 연결됨", SUCCESS)
+                            (
+                                self.peer_nickname.as_deref().unwrap_or("상대방"),
+                                SUCCESS,
+                            )
                         } else {
                             ("상대방 기다리는 중", WARNING)
                         };
@@ -1246,9 +1326,13 @@ impl Drop for ChatApp {
 }
 
 fn render_message_bubble(ui: &mut egui::Ui, message: &ChatMessage, max_width: f32) {
-    let (layout, fill, label) = match message.author {
+    let (layout, fill, label) = match &message.author {
         MessageAuthor::Me => (Layout::right_to_left(Align::TOP), PRIMARY, "나"),
-        MessageAuthor::Peer => (Layout::left_to_right(Align::TOP), SURFACE_RAISED, "상대방"),
+        MessageAuthor::Peer(nickname) => (
+            Layout::left_to_right(Align::TOP),
+            SURFACE_RAISED,
+            nickname.as_str(),
+        ),
     };
 
     ui.with_layout(layout, |ui| {

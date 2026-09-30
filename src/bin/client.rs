@@ -55,11 +55,14 @@ fn run_app(selected_renderer: eframe::Renderer, ready_file: Option<PathBuf>) -> 
         })
         .expect("failed to start network thread");
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/app-icon.png"))
+        .expect("embedded application icon must be a valid PNG");
     let options = eframe::NativeOptions {
         renderer: selected_renderer,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([980.0, 720.0])
-            .with_min_inner_size([720.0, 540.0]),
+            .with_min_inner_size([720.0, 540.0])
+            .with_icon(icon),
         ..Default::default()
     };
 
