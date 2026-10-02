@@ -34,6 +34,7 @@ pub enum NetworkCommand {
         nickname: String,
     },
     RefreshPublicRooms,
+    RetryPeerConnection,
     LeaveRoom,
     SendMessage(String),
 }
@@ -71,10 +72,10 @@ pub enum NetworkEvent {
         nickname: String,
         safety_number: Option<String>,
     },
+    PeerConnecting,
     PeerDisconnected,
+    PeerConnectionFailed(PeerConnectionFailure),
     RoomExpired,
-
-    P2pFailed,
 
     MessagePending {
         id: u64,
@@ -88,6 +89,15 @@ pub enum NetworkEvent {
     MessageReceived(String),
 
     Error(NetworkError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerConnectionFailure {
+    UdpRegistration,
+    HandshakeTimedOut,
+    ConnectionLost,
+    SecurityError,
+    NoCompatibleNetwork,
 }
 
 #[derive(Debug, Clone)]

@@ -105,6 +105,8 @@ CREATE
 JOIN <room_code>
 LEAVE
 P2P_FAILED
+RETRY_P2P
+P2P_RETRY 4
 ```
 
 ### 서버 → 클라이언트 TCP
@@ -116,8 +118,10 @@ JOINED <room_code>
 ROOM_NOT_FOUND
 ROOM_FULL
 ALREADY_IN_ROOM
-PEER <ip:port>
+PEER <ip:port> <role> <session_nonce>
 PEER_LEFT <client_id>
+PEER_NOT_AVAILABLE
+REFRESH_UDP
 LEFT
 P2P_DISCONNECTED
 ```

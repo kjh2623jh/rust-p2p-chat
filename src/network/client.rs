@@ -1,4 +1,4 @@
-use super::{NetworkCommand, NetworkError, NetworkEvent, PublicRoomSummary};
+use super::{NetworkCommand, NetworkError, NetworkEvent, PeerConnectionFailure, PublicRoomSummary};
 use crate::protocol::{
     InviteCode, MAX_DATAGRAM, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS, MAX_SIGNAL_LINE,
     PROTOCOL_VERSION, decode_hex, decode_public_room_title, encode_hex, encode_public_room_title,
@@ -52,6 +52,7 @@ const MAX_HISTORY_DEDUP: usize = 512;
 const IPV4_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 const PEER_IPV4_RETRY_DELAY: Duration = Duration::from_secs(3);
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WAITING_REGISTRATION_REFRESH: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum IpFamily {
@@ -209,12 +210,18 @@ struct RegistrationAttempt {
 struct RegistrationState {
     attempts: HashMap<IpFamily, RegistrationAttempt>,
     registered: HashSet<IpFamily>,
+    refresh_at: Option<Instant>,
 }
 
 impl RegistrationState {
     fn clear(&mut self) {
         self.attempts.clear();
         self.registered.clear();
+        self.refresh_at = None;
+    }
+
+    fn refresh_due(&self, now: Instant) -> bool {
+        self.attempts.is_empty() && self.refresh_at.is_some_and(|refresh_at| now >= refresh_at)
     }
 }
 
@@ -589,6 +596,12 @@ impl NetworkClient {
                             }
                         }
                         NetworkCommand::RefreshPublicRooms => writer.write_all(b"LIST_PUBLIC\n").await?,
+                        NetworkCommand::RetryPeerConnection => {
+                            if room.is_some() && peer.is_none() {
+                                writer.write_all(b"RETRY_P2P\n").await?;
+                                let _ = self.event_tx.send(NetworkEvent::PeerConnecting).await;
+                            }
+                        }
                         NetworkCommand::LeaveRoom => {
                             writer.write_all(b"LEAVE\n").await?;
                             fail_pending(&mut peer, &self.event_tx, "대화방에서 나갔습니다.").await;
@@ -649,8 +662,9 @@ impl NetworkClient {
                         writer.write_all(b"P2P_FAILED\n").await?;
                         fail_pending(&mut peer, &self.event_tx, "보안 연결이 종료되었습니다.").await;
                         peer = None;
-                        room = None;
-                        let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
+                        let _ = self.event_tx.send(NetworkEvent::PeerConnectionFailed(
+                            PeerConnectionFailure::SecurityError
+                        )).await;
                     }
                 }
                 received = recv_from_optional(udp.ipv6.as_ref(), &mut udp_v6_buffer) => {
@@ -665,8 +679,9 @@ impl NetworkClient {
                         writer.write_all(b"P2P_FAILED\n").await?;
                         fail_pending(&mut peer, &self.event_tx, "보안 연결이 종료되었습니다.").await;
                         peer = None;
-                        room = None;
-                        let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
+                        let _ = self.event_tx.send(NetworkEvent::PeerConnectionFailed(
+                            PeerConnectionFailure::SecurityError
+                        )).await;
                     }
                 }
                 _ = timer.tick() => {
@@ -674,22 +689,25 @@ impl NetworkClient {
                         && registration.registered.is_empty()
                     {
                         writer.write_all(b"P2P_FAILED\n").await?;
-                        registration.clear();
-                        room = None;
-                        let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
+                        registration.refresh_at = Some(Instant::now() + WAITING_REGISTRATION_REFRESH);
+                        let _ = self.event_tx.send(NetworkEvent::PeerConnectionFailed(
+                            PeerConnectionFailure::UdpRegistration
+                        )).await;
                         continue;
+                    }
+                    if room.is_some() && peer.is_none() && registration.refresh_due(Instant::now()) {
+                        registration = begin_registration(&udp, udp_servers, &client_id).await?;
                     }
                     match tick_peer(&mut peer, &udp, &self.event_tx).await? {
                         PeerTickAction::Continue => {}
                         PeerTickAction::RetryIpv4 => {
                             writer.write_all(b"P2P_RETRY 4\n").await?;
                         }
-                        PeerTickAction::Failed => {
+                        PeerTickAction::Failed(reason) => {
                             writer.write_all(b"P2P_FAILED\n").await?;
                             fail_pending(&mut peer, &self.event_tx, "상대방의 응답이 없습니다.").await;
                             peer = None;
-                            room = None;
-                            let _ = self.event_tx.send(NetworkEvent::P2pFailed).await;
+                            let _ = self.event_tx.send(NetworkEvent::PeerConnectionFailed(reason)).await;
                         }
                     }
                 }
@@ -733,7 +751,10 @@ async fn begin_registration(
 ) -> io::Result<RegistrationState> {
     let now = Instant::now();
     let prefer_ipv6 = servers.ipv6.is_some() && udp.ipv6.is_some();
-    let mut state = RegistrationState::default();
+    let mut state = RegistrationState {
+        refresh_at: Some(now + WAITING_REGISTRATION_REFRESH),
+        ..RegistrationState::default()
+    };
 
     for family in [IpFamily::V6, IpFamily::V4] {
         let (Some(server), Some(_)) = (servers.get(family), udp.get(family)) else {
@@ -933,6 +954,12 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
                 registration.registered.insert(family);
             }
         }
+        Some("REFRESH_UDP") if parts.next().is_none() => {
+            fail_pending(peer, event_tx, "P2P 연결을 다시 준비하고 있습니다.").await;
+            *peer = None;
+            *registration = begin_registration(udp, udp_servers, client_id).await?;
+            let _ = event_tx.send(NetworkEvent::PeerConnecting).await;
+        }
         Some("PEER") => {
             let (Some(address), Some(role), Some(nonce)) =
                 (parts.next(), parts.next(), parts.next())
@@ -955,6 +982,7 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
             match SecurePeer::new(address, role == "I", room_context) {
                 Ok(new_peer) => {
                     *peer = Some(new_peer);
+                    let _ = event_tx.send(NetworkEvent::PeerConnecting).await;
                 }
                 Err(error) => {
                     let _ = event_tx.send(NetworkEvent::Error(error)).await;
@@ -1057,27 +1085,46 @@ async fn handle_server_line<W: AsyncWrite + Unpin>(
         }
         Some("PEER_LEFT") => {
             fail_pending(peer, event_tx, "상대방과 연결이 종료되었습니다.").await;
-            registration.clear();
+            *peer = None;
+            if room.is_some() {
+                *registration = begin_registration(udp, udp_servers, client_id).await?;
+            }
+            let _ = event_tx.send(NetworkEvent::PeerDisconnected).await;
+        }
+        Some("P2P_DISCONNECTED") => {
+            if peer.is_some() {
+                fail_pending(peer, event_tx, "상대방과 직접 연결이 끊겼습니다.").await;
+                *peer = None;
+                let _ = event_tx
+                    .send(NetworkEvent::PeerConnectionFailed(
+                        PeerConnectionFailure::ConnectionLost,
+                    ))
+                    .await;
+            }
+        }
+        Some("PEER_NOT_AVAILABLE") => {
+            fail_pending(peer, event_tx, "현재 방에 연결할 상대방이 없습니다.").await;
             *peer = None;
             let _ = event_tx.send(NetworkEvent::PeerDisconnected).await;
         }
         Some("P2P_UNAVAILABLE") => {
-            writer.write_all(b"P2P_FAILED\n").await?;
             fail_pending(
                 peer,
                 event_tx,
                 "상대방과 호환되는 네트워크 경로가 없습니다.",
             )
             .await;
-            registration.clear();
             *peer = None;
-            *room = None;
             let _ = event_tx
                 .send(NetworkEvent::Error(NetworkError::Transport(
                     "상대방과 공통으로 사용할 수 있는 IPv4 또는 IPv6 경로가 없습니다.".to_owned(),
                 )))
                 .await;
-            let _ = event_tx.send(NetworkEvent::P2pFailed).await;
+            let _ = event_tx
+                .send(NetworkEvent::PeerConnectionFailed(
+                    PeerConnectionFailure::NoCompatibleNetwork,
+                ))
+                .await;
         }
         Some("ROOM_EXPIRED") => {
             writer.write_all(b"LEAVE\n").await?;
@@ -1328,7 +1375,7 @@ fn decode_ready_nickname(plaintext: &[u8]) -> Option<String> {
 enum PeerTickAction {
     Continue,
     RetryIpv4,
-    Failed,
+    Failed(PeerConnectionFailure),
 }
 
 fn peer_connection_action(peer: &mut SecurePeer, now: Instant) -> PeerTickAction {
@@ -1337,7 +1384,7 @@ fn peer_connection_action(peer: &mut SecurePeer, now: Instant) -> PeerTickAction
     }
     let elapsed = now.duration_since(peer.started_at);
     if elapsed >= PEER_CONNECT_TIMEOUT {
-        return PeerTickAction::Failed;
+        return PeerTickAction::Failed(PeerConnectionFailure::HandshakeTimedOut);
     }
     if peer.address.is_ipv6()
         && elapsed >= PEER_IPV4_RETRY_DELAY
@@ -1380,8 +1427,9 @@ async fn tick_peer(
         send_ready(peer, udp).await.map_err(network_error_to_io)?;
     }
     if peer.connected && now.duration_since(peer.last_received) > Duration::from_secs(90) {
-        let _ = event_tx.send(NetworkEvent::PeerDisconnected).await;
-        return Ok(PeerTickAction::Failed);
+        return Ok(PeerTickAction::Failed(
+            PeerConnectionFailure::ConnectionLost,
+        ));
     }
     if peer.connected && now.duration_since(peer.last_heartbeat_send) >= Duration::from_secs(30) {
         let packet = peer
@@ -1654,6 +1702,28 @@ mod tests {
     }
 
     #[test]
+    fn waiting_registration_refresh_only_runs_when_idle_and_due() {
+        let now = Instant::now();
+        let mut registration = RegistrationState {
+            refresh_at: Some(now + WAITING_REGISTRATION_REFRESH),
+            ..RegistrationState::default()
+        };
+        assert!(!registration.refresh_due(now));
+        assert!(registration.refresh_due(now + WAITING_REGISTRATION_REFRESH));
+
+        registration.attempts.insert(
+            IpFamily::V4,
+            RegistrationAttempt {
+                nonce: [1; 16],
+                started_at: now,
+                next_probe: now,
+                server: "127.0.0.1:9001".parse().unwrap(),
+            },
+        );
+        assert!(!registration.refresh_due(now + WAITING_REGISTRATION_REFRESH));
+    }
+
+    #[test]
     fn noise_psk_authenticates_and_detects_tampering() {
         let invite = InviteCode::generate();
         let room = RoomContext {
@@ -1786,7 +1856,7 @@ mod tests {
         );
         assert_eq!(
             peer_connection_action(&mut peer, started_at + PEER_CONNECT_TIMEOUT),
-            PeerTickAction::Failed
+            PeerTickAction::Failed(PeerConnectionFailure::HandshakeTimedOut)
         );
     }
 
@@ -1808,7 +1878,7 @@ mod tests {
         );
         assert_eq!(
             peer_connection_action(&mut peer, started_at + PEER_CONNECT_TIMEOUT),
-            PeerTickAction::Failed
+            PeerTickAction::Failed(PeerConnectionFailure::HandshakeTimedOut)
         );
     }
 

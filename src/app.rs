@@ -10,7 +10,7 @@ use rand::Rng;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use zeroize::Zeroize;
 
-use crate::network::{NetworkCommand, NetworkEvent, PublicRoomSummary};
+use crate::network::{NetworkCommand, NetworkEvent, PeerConnectionFailure, PublicRoomSummary};
 use crate::protocol::{
     InviteCode, MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS, MAX_NICKNAME_CHARS,
     MAX_PUBLIC_ROOM_TITLE_CHARS, normalize_nickname, normalize_public_room_title,
@@ -84,6 +84,9 @@ pub struct ChatApp {
     nickname: String,
     peer_nickname: Option<String>,
     peer_connected: bool,
+    peer_connecting: bool,
+    peer_connection_failed: bool,
+    show_security_info: bool,
     room_visibility: RoomVisibility,
     public_room_title: String,
     public_rooms: Vec<PublicRoomSummary>,
@@ -121,6 +124,9 @@ impl ChatApp {
             nickname: format!("익명-{:04}", rand::rng().random_range(1000..=9999)),
             peer_nickname: None,
             peer_connected: false,
+            peer_connecting: false,
+            peer_connection_failed: false,
+            show_security_info: false,
             room_visibility: RoomVisibility::Public,
             public_room_title: String::new(),
             public_rooms: Vec::new(),
@@ -282,32 +288,37 @@ impl ChatApp {
                 } => {
                     if self.current_room.is_some() {
                         self.peer_connected = true;
+                        self.peer_connecting = false;
+                        self.peer_connection_failed = false;
                         self.peer_nickname = Some(nickname.clone());
-                        self.safety_number = safety_number.clone();
-                        if let Some(number) = safety_number {
-                            self.set_notice(
-                                NoticeTone::Success,
-                                "공개방 P2P 연결 완료",
-                                format!(
-                                    "{nickname}님과 연결되었습니다. 안전번호 {number}가 상대 화면과 같은지 다른 채널로 확인하세요."
-                                ),
-                            );
-                        } else {
-                            self.set_notice(
-                                NoticeTone::Success,
-                                "P2P 연결 완료",
-                                format!(
-                                    "{nickname}님과 연결되었습니다. 메시지는 서버를 거치지 않고 직접 전송됩니다."
-                                ),
-                            );
-                        }
+                        self.safety_number = safety_number;
+                        self.show_security_info = false;
+                        self.set_notice(
+                            NoticeTone::Success,
+                            "P2P 연결 완료",
+                            format!(
+                                "{nickname}님과 연결되었습니다. 메시지는 서버를 거치지 않고 직접 전송됩니다."
+                            ),
+                        );
                         self.focus_message = true;
+                    }
+                }
+                NetworkEvent::PeerConnecting => {
+                    if self.current_room.is_some() {
+                        self.peer_connected = false;
+                        self.peer_connecting = true;
+                        self.peer_connection_failed = false;
+                        self.safety_number = None;
+                        self.show_security_info = false;
                     }
                 }
                 NetworkEvent::PeerDisconnected => {
                     if self.current_room.is_some() {
                         self.peer_connected = false;
+                        self.peer_connecting = false;
+                        self.peer_connection_failed = false;
                         self.safety_number = None;
+                        self.show_security_info = false;
                         self.peer_nickname = None;
                         self.message_input.clear();
                         self.focus_message = false;
@@ -322,21 +333,42 @@ impl ChatApp {
                         );
                     }
                 }
+                NetworkEvent::PeerConnectionFailed(reason) => {
+                    if self.current_room.is_some() {
+                        self.peer_connected = false;
+                        self.peer_connecting = false;
+                        self.peer_connection_failed = true;
+                        self.safety_number = None;
+                        self.show_security_info = false;
+                        self.peer_nickname = None;
+                        self.message_input.clear();
+                        self.focus_message = false;
+                        let detail = match reason {
+                            PeerConnectionFailure::UdpRegistration => {
+                                "UDP 경로를 준비하지 못했습니다. 방은 유지되며 다시 시도할 수 있습니다."
+                            }
+                            PeerConnectionFailure::HandshakeTimedOut => {
+                                "상대방의 응답이 없어 연결 시간이 초과되었습니다. 방은 유지됩니다."
+                            }
+                            PeerConnectionFailure::ConnectionLost => {
+                                "상대방과의 직접 연결이 끊겼습니다. 방은 유지됩니다."
+                            }
+                            PeerConnectionFailure::SecurityError => {
+                                "보안 연결을 확인하지 못했습니다. 방은 유지되며 다시 시도할 수 있습니다."
+                            }
+                            PeerConnectionFailure::NoCompatibleNetwork => {
+                                "공통으로 사용할 수 있는 IPv4 또는 IPv6 경로가 없습니다. 방은 유지됩니다."
+                            }
+                        };
+                        self.set_notice(NoticeTone::Error, "P2P 연결에 실패했습니다", detail);
+                    }
+                }
                 NetworkEvent::RoomExpired => {
                     self.reset_room_state();
                     self.set_notice(
                         NoticeTone::Warning,
                         "방의 대기 시간이 만료되었습니다",
                         "새 방을 만들거나 다른 보안 초대 코드로 입장해 주세요.",
-                    );
-                    self.focus_room_code = true;
-                }
-                NetworkEvent::P2pFailed => {
-                    self.reset_room_state();
-                    self.set_notice(
-                        NoticeTone::Error,
-                        "상대방과 직접 연결하지 못했습니다",
-                        "네트워크 환경을 확인하고 새 방에서 다시 시도해 주세요.",
                     );
                     self.focus_room_code = true;
                 }
@@ -409,6 +441,9 @@ impl ChatApp {
         self.room_code.zeroize();
         self.room_request_pending = false;
         self.peer_connected = false;
+        self.peer_connecting = false;
+        self.peer_connection_failed = false;
+        self.show_security_info = false;
         self.messages.clear();
         self.message_input.clear();
     }
@@ -424,6 +459,9 @@ impl ChatApp {
         self.room_code.zeroize();
         self.room_request_pending = false;
         self.peer_connected = false;
+        self.peer_connecting = false;
+        self.peer_connection_failed = false;
+        self.show_security_info = false;
         self.message_input.clear();
         self.confirm_leave = false;
         self.focus_leave_cancel = false;
@@ -588,6 +626,22 @@ impl ChatApp {
         }
     }
 
+    fn retry_peer_connection(&mut self) {
+        if self.current_room.is_some()
+            && !self.peer_connected
+            && !self.peer_connecting
+            && self.send_command(NetworkCommand::RetryPeerConnection)
+        {
+            self.peer_connecting = true;
+            self.peer_connection_failed = false;
+            self.set_notice(
+                NoticeTone::Info,
+                "P2P 연결을 다시 시도합니다",
+                "방을 유지한 채 상대방과 새 보안 연결을 준비하고 있습니다.",
+            );
+        }
+    }
+
     fn send_message(&mut self) {
         let message = self.message_input.trim().to_string();
         let character_count = message.chars().count();
@@ -661,7 +715,7 @@ impl ChatApp {
                 ui.label(
                     RichText::new(if self.current_room.is_some() {
                         if self.current_room_public {
-                            "공개방 메시지는 암호화되어 직접 전송됩니다. 안전번호를 상대방과 비교하세요."
+                            "공개방 메시지는 암호화되어 상대방에게 직접 전송됩니다."
                         } else {
                             "종단간 암호화된 메시지를 상대방과 직접 주고받습니다."
                         }
@@ -719,12 +773,27 @@ impl ChatApp {
                         ),
                         SUCCESS,
                     );
+                } else if self.peer_connecting {
+                    status_pill(ui, "P2P 연결 중", PRIMARY_HOVER);
+                } else if self.peer_connection_failed {
+                    status_pill(ui, "연결 실패", ERROR);
                 } else if room_fingerprint.is_some() {
                     status_pill(ui, "상대방 대기 중", WARNING);
                 }
 
-                if let Some(number) = &self.safety_number {
-                    status_pill(ui, &format!("안전번호 {number}"), PRIMARY_HOVER);
+                if self.safety_number.is_some() {
+                    let security_response = ui
+                        .add(
+                            egui::Button::new(RichText::new("보안 정보").size(11.0).color(MUTED))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0, BORDER))
+                                .corner_radius(CornerRadius::same(6)),
+                        )
+                        .on_hover_text("공개방 연결의 안전번호 확인");
+                    paint_focus_ring(ui, &security_response, 6);
+                    if security_response.clicked() {
+                        self.show_security_info = !self.show_security_info;
+                    }
                 }
 
                 if let Some(room_name) = room_fingerprint {
@@ -737,6 +806,31 @@ impl ChatApp {
                 }
             });
         });
+
+        if self.show_security_info
+            && let Some(number) = &self.safety_number
+        {
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(12, 9))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("안전번호 {number}"))
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "상대방과 별도 채널로 이 번호를 비교하면 공개방 연결에 대한 중간자 공격을 탐지할 수 있습니다. 비교하지 않아도 메시지 암호화는 유지됩니다.",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                });
+        }
     }
 
     fn render_notice(&mut self, ui: &mut egui::Ui) {
@@ -1135,6 +1229,10 @@ impl ChatApp {
                                 self.peer_nickname.as_deref().unwrap_or("상대방"),
                                 SUCCESS,
                             )
+                        } else if self.peer_connecting {
+                            ("연결하는 중", PRIMARY_HOVER)
+                        } else if self.peer_connection_failed {
+                            ("연결 실패", ERROR)
                         } else {
                             ("상대방 기다리는 중", WARNING)
                         };
@@ -1182,6 +1280,43 @@ impl ChatApp {
                         }
                     });
             });
+
+        let mut retry_requested = false;
+        if self.peer_connection_failed {
+            egui::Frame::new()
+                .fill(ERROR.gamma_multiply(0.10))
+                .stroke(Stroke::new(1.0, ERROR.gamma_multiply(0.45)))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::symmetric(12, 9))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(
+                                "방은 유지되고 있습니다. 연결을 다시 시도할 수 있습니다.",
+                            )
+                            .size(12.0)
+                            .color(TEXT),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let retry = ui.add(
+                                egui::Button::new(
+                                    RichText::new("연결 다시 시도")
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(PRIMARY)
+                                .stroke(Stroke::NONE)
+                                .corner_radius(CornerRadius::same(6)),
+                            );
+                            paint_focus_ring(ui, &retry, 6);
+                            retry_requested = retry.clicked();
+                        });
+                    });
+                });
+        }
+        if retry_requested {
+            self.retry_peer_connection();
+        }
 
         ui.add_space(gap);
 

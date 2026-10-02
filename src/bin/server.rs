@@ -110,6 +110,7 @@ struct Room {
     created_at: Instant,
     peers: HashMap<String, Peer>,
     selected_family: Option<IpFamily>,
+    p2p_failed: bool,
 }
 
 enum RoomKind {
@@ -527,7 +528,29 @@ async fn handle_client(
                     retry_peer_family(&state, room_id, &client_id, IpFamily::V4).await;
                 }
             }
-            Some("LEAVE") | Some("P2P_FAILED") => {
+            Some("RETRY_P2P") => {
+                if parts.next().is_some() {
+                    let _ = tx.send("ERROR INVALID_COMMAND\n".to_owned()).await;
+                    continue;
+                }
+                if let Some(room_id) = current_room.as_deref() {
+                    retry_peer_connection(&state, room_id, &client_id).await;
+                }
+            }
+            Some("P2P_FAILED") => {
+                if parts.next().is_some() {
+                    let _ = tx.send("ERROR INVALID_COMMAND\n".to_owned()).await;
+                    continue;
+                }
+                if let Some(room_id) = current_room.as_deref() {
+                    notify_p2p_disconnected(&state, room_id, &client_id).await;
+                }
+            }
+            Some("LEAVE") => {
+                if parts.next().is_some() {
+                    let _ = tx.send("ERROR INVALID_COMMAND\n".to_owned()).await;
+                    continue;
+                }
                 if let Some(room_id) = current_room.take() {
                     leave_room(&state, &room_id, &client_id).await;
                 }
@@ -546,6 +569,86 @@ async fn handle_client(
     Ok(())
 }
 
+async fn notify_p2p_disconnected(state: &SharedState, room_id: &str, reporting_client_id: &str) {
+    let senders = {
+        let mut state = state.lock().await;
+        let Some(room) = state.rooms.get_mut(room_id) else {
+            return;
+        };
+        if room.peers.len() != 2 || !room.peers.contains_key(reporting_client_id) || room.p2p_failed
+        {
+            return;
+        }
+        room.p2p_failed = true;
+        room.peers
+            .values()
+            .map(|peer| peer.sender.clone())
+            .collect::<Vec<_>>()
+    };
+    for sender in senders {
+        let _ = sender.send("P2P_DISCONNECTED\n".to_owned()).await;
+    }
+    info!(room = %short_id(room_id), "peer connection failed; room retained");
+}
+
+async fn retry_peer_connection(state: &SharedState, room_id: &str, requesting_client_id: &str) {
+    enum RetryResult {
+        Refresh {
+            nonce: [u8; 16],
+            senders: Vec<ClientSender>,
+        },
+        NoPeer(ClientSender),
+        Ignore,
+    }
+
+    let result = {
+        let mut state = state.lock().await;
+        let Some(room) = state.rooms.get_mut(room_id) else {
+            return;
+        };
+        let Some(requester_sender) = room
+            .peers
+            .get(requesting_client_id)
+            .map(|peer| peer.sender.clone())
+        else {
+            return;
+        };
+        if room.peers.len() != 2 {
+            RetryResult::NoPeer(requester_sender)
+        } else if !room.p2p_failed {
+            RetryResult::Ignore
+        } else {
+            room.p2p_failed = false;
+            room.selected_family = None;
+            for peer in room.peers.values_mut() {
+                peer.endpoints = PeerEndpoints::default();
+            }
+            RetryResult::Refresh {
+                nonce: room.session_nonce,
+                senders: room
+                    .peers
+                    .values()
+                    .map(|peer| peer.sender.clone())
+                    .collect(),
+            }
+        }
+    };
+
+    match result {
+        RetryResult::Refresh { nonce, senders } => {
+            for sender in senders {
+                let _ = sender.send("REFRESH_UDP\n".to_owned()).await;
+            }
+            schedule_peer_match_timeout(Arc::clone(state), room_id.to_owned(), nonce);
+            info!(room = %short_id(room_id), "peer connection retry started");
+        }
+        RetryResult::NoPeer(sender) => {
+            let _ = sender.send("PEER_NOT_AVAILABLE\n".to_owned()).await;
+        }
+        RetryResult::Ignore => {}
+    }
+}
+
 async fn retry_peer_family(
     state: &SharedState,
     room_id: &str,
@@ -559,6 +662,7 @@ async fn retry_peer_family(
         };
         if room.peers.len() != 2
             || !room.peers.contains_key(requesting_client_id)
+            || room.p2p_failed
             || room.selected_family == Some(family)
             || !room
                 .peers
@@ -568,6 +672,7 @@ async fn retry_peer_family(
             return;
         }
         room.selected_family = Some(family);
+        room.p2p_failed = false;
         let peers = room
             .peers
             .iter()
@@ -627,6 +732,7 @@ async fn create_room(
                 created_at: Instant::now(),
                 peers,
                 selected_family: None,
+                p2p_failed: false,
             },
         );
     }
@@ -680,6 +786,7 @@ async fn create_public_room(
                 created_at: Instant::now(),
                 peers,
                 selected_family: None,
+                p2p_failed: false,
             },
         );
         rank
@@ -772,6 +879,7 @@ async fn leave_room(state: &SharedState, room_id: &str, client_id: &str) {
         let departing_creator = room.creator == client_id;
         room.peers.remove(client_id);
         room.selected_family = None;
+        room.p2p_failed = false;
         if let Some(remaining_client_id) = room.peers.keys().next().cloned() {
             if departing_creator {
                 room.creator = remaining_client_id;
@@ -988,7 +1096,7 @@ async fn register_udp_addr(state: &SharedState, client_id: &str, udp_addr: Socke
                 continue;
             };
             peer.endpoints.insert(udp_addr);
-            if room.peers.len() == 2 && room.selected_family.is_none() {
+            if room.peers.len() == 2 && room.selected_family.is_none() && !room.p2p_failed {
                 let family = select_common_family(room.peers.values());
                 if let Some(family) = family {
                     room.selected_family = Some(family);
@@ -1282,6 +1390,7 @@ mod tests {
                     ),
                 ]),
                 selected_family: Some(IpFamily::V6),
+                p2p_failed: false,
             },
         );
 
@@ -1295,6 +1404,152 @@ mod tests {
         let room = state.rooms.get("room").unwrap();
         assert_eq!(room.selected_family, Some(IpFamily::V4));
         assert_eq!(room.peers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn p2p_failure_notifies_both_peers_without_removing_them() {
+        let state = Arc::new(Mutex::new(ServerState::default()));
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        state.lock().await.rooms.insert(
+            "room".to_owned(),
+            Room {
+                creator: "first".to_owned(),
+                kind: RoomKind::Private,
+                session_nonce: [3; 16],
+                created_at: Instant::now(),
+                peers: HashMap::from([
+                    (
+                        "first".to_owned(),
+                        Peer {
+                            sender: first_tx,
+                            endpoints: PeerEndpoints {
+                                ipv4: Some("198.51.100.1:40000".parse().unwrap()),
+                                ipv6: None,
+                            },
+                        },
+                    ),
+                    (
+                        "second".to_owned(),
+                        Peer {
+                            sender: second_tx,
+                            endpoints: PeerEndpoints {
+                                ipv4: Some("198.51.100.2:40001".parse().unwrap()),
+                                ipv6: None,
+                            },
+                        },
+                    ),
+                ]),
+                selected_family: Some(IpFamily::V4),
+                p2p_failed: false,
+            },
+        );
+
+        notify_p2p_disconnected(&state, "room", "first").await;
+
+        assert_eq!(first_rx.recv().await.as_deref(), Some("P2P_DISCONNECTED\n"));
+        assert_eq!(
+            second_rx.recv().await.as_deref(),
+            Some("P2P_DISCONNECTED\n")
+        );
+        let state = state.lock().await;
+        let room = state.rooms.get("room").unwrap();
+        assert_eq!(room.peers.len(), 2);
+        assert_eq!(room.selected_family, Some(IpFamily::V4));
+        assert!(room.p2p_failed);
+    }
+
+    #[tokio::test]
+    async fn lone_waiting_peer_is_not_marked_failed() {
+        let state = Arc::new(Mutex::new(ServerState::default()));
+        let (sender, mut receiver) = mpsc::channel(4);
+        create_room(&state, "11111111111111111111111111111111", "first", sender)
+            .await
+            .unwrap();
+        let _ = receiver.recv().await;
+
+        notify_p2p_disconnected(&state, "11111111111111111111111111111111", "first").await;
+
+        assert!(receiver.try_recv().is_err());
+        let state = state.lock().await;
+        let room = state.rooms.get("11111111111111111111111111111111").unwrap();
+        assert_eq!(room.peers.len(), 1);
+        assert!(!room.p2p_failed);
+    }
+
+    #[tokio::test]
+    async fn manual_retry_keeps_room_and_restarts_both_peers() {
+        let state = Arc::new(Mutex::new(ServerState::default()));
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        state.lock().await.rooms.insert(
+            "room".to_owned(),
+            Room {
+                creator: "first".to_owned(),
+                kind: RoomKind::Private,
+                session_nonce: [4; 16],
+                created_at: Instant::now(),
+                peers: HashMap::from([
+                    (
+                        "first".to_owned(),
+                        Peer {
+                            sender: first_tx,
+                            endpoints: PeerEndpoints {
+                                ipv4: Some("198.51.100.1:40000".parse().unwrap()),
+                                ipv6: None,
+                            },
+                        },
+                    ),
+                    (
+                        "second".to_owned(),
+                        Peer {
+                            sender: second_tx,
+                            endpoints: PeerEndpoints {
+                                ipv4: Some("198.51.100.2:40001".parse().unwrap()),
+                                ipv6: None,
+                            },
+                        },
+                    ),
+                ]),
+                selected_family: Some(IpFamily::V4),
+                p2p_failed: true,
+            },
+        );
+
+        retry_peer_connection(&state, "room", "first").await;
+
+        assert_eq!(first_rx.recv().await.as_deref(), Some("REFRESH_UDP\n"));
+        assert_eq!(second_rx.recv().await.as_deref(), Some("REFRESH_UDP\n"));
+        {
+            let state = state.lock().await;
+            let room = state.rooms.get("room").unwrap();
+            assert_eq!(room.peers.len(), 2);
+            assert_eq!(room.selected_family, None);
+            assert!(!room.p2p_failed);
+            assert!(room.peers.values().all(|peer| peer.endpoints.is_empty()));
+        }
+
+        register_udp_addr(&state, "first", "198.51.100.1:41000".parse().unwrap()).await;
+        register_udp_addr(&state, "second", "198.51.100.2:41001".parse().unwrap()).await;
+        assert!(
+            first_rx
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("PEER 198.51.100.2:41001 I ")
+        );
+        assert!(
+            second_rx
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("PEER 198.51.100.1:41000 R ")
+        );
+        let state = state.lock().await;
+        let room = state.rooms.get("room").unwrap();
+        assert_eq!(room.peers.len(), 2);
+        assert_eq!(room.selected_family, Some(IpFamily::V4));
+        assert!(!room.p2p_failed);
     }
 
     #[test]
@@ -1499,6 +1754,38 @@ mod tests {
         let reopened = collect_public_list(&state).await;
         assert!(reopened[1].starts_with(&format!("PUBLIC_ROOM {new_room} 1 ")));
         assert!(reopened[2].starts_with(&format!("PUBLIC_ROOM {old_room} 1 ")));
+    }
+
+    #[tokio::test]
+    async fn public_room_stays_full_until_a_peer_actually_leaves() {
+        let state = Arc::new(Mutex::new(ServerState::default()));
+        let room_id = "55555555555555555555555555555555";
+        let (creator_tx, mut creator_rx) = mpsc::channel(8);
+        let (joiner_tx, mut joiner_rx) = mpsc::channel(8);
+        create_public_room(
+            &state,
+            room_id,
+            "재연결 방".to_owned(),
+            "creator",
+            creator_tx,
+        )
+        .await
+        .unwrap();
+        join_public_room(&state, room_id, "joiner", joiner_tx)
+            .await
+            .unwrap();
+        let _ = creator_rx.recv().await;
+        let _ = joiner_rx.recv().await;
+
+        notify_p2p_disconnected(&state, room_id, "creator").await;
+
+        let rooms = collect_public_list(&state).await;
+        assert!(rooms[1].starts_with(&format!("PUBLIC_ROOM {room_id} 2 ")));
+        assert_eq!(state.lock().await.rooms[room_id].peers.len(), 2);
+
+        leave_room(&state, room_id, "joiner").await;
+        let rooms = collect_public_list(&state).await;
+        assert!(rooms[1].starts_with(&format!("PUBLIC_ROOM {room_id} 1 ")));
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
 use zeroize::Zeroize;
 
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 6;
 pub const MAX_SIGNAL_LINE: usize = 512;
 pub const MAX_DATAGRAM: usize = 1200;
 pub const MAX_MESSAGE_CHARS: usize = 500;
